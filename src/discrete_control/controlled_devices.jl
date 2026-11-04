@@ -616,19 +616,34 @@ _in_deadband(d::BranchDevice, y::Float64) = d.band && d.side == 0 && d.v_lo <= y
 # the band). It is released, and held from then on, when its voltage is inside the band while
 # it still sits at its anchor: the band was reached without it (other devices moved the
 # voltage), or `_band_clamp` stopped its retreat there.
+# A latched device re-latches on the opposite side only from its anchor (GAP-068): when its own
+# move carried its voltage across the whole band (the low-steepness stage's fixed point lies
+# ln(pos/(1−pos))/S past the edge for a device far from mid-range), it keeps regulating toward its
+# first edge, whose law brings it back as S grows, and the clamp stops it at its anchor; there, a
+# voltage still on the far side is a real reversal and re-latches. So every anchor is a position
+# the device actually held (its stored setting, or a level), never an off-grid continuous value.
+# This applies to the devices that snap to a grid (`_band_capable`); a continuous banded shunt
+# (MODSW 2, GAP-056's shared band) re-latches as before and settles on the far edge.
 _update_band_state!(::AbstractControlledDevice, ::Float64) = nothing
 function _update_band_state!(d::BandedDevice, y::Float64)
     d.band || return
     lo, hi = band_edges(d)
+    away = abs(d.current - d.anchor) >= _param_tol(d)
+    keep = away && _band_capable(d)
     if y < lo
-        d.side == -1 || (d.side = -1; d.anchor = d.current)
+        (d.side == 1 && keep) || d.side == -1 || (d.side = -1; d.anchor = d.current)
     elseif y > hi
-        d.side == 1 || (d.side = 1; d.anchor = d.current)
-    elseif d.side != 0 && abs(d.current - d.anchor) < _param_tol(d)
+        (d.side == -1 && keep) || d.side == 1 || (d.side = 1; d.anchor = d.current)
+    elseif d.side != 0 && !away
         d.side = 0
     end
     return
 end
+
+# A banded device that snaps to a discrete grid (the band settle's devices).
+_band_capable(d::ControlledTap) = d.band
+_band_capable(d::ControlledPhaseShifter) = d.band && !isempty(d.levels)
+_band_capable(d::ControlledSwitchedShunt) = d.band && !d.continuous
 
 # A latched tap never retreats past its anchor: the edge it regulates to is approached from
 # outside the band, so moving back beyond where it latched would leave the band on the other
@@ -704,12 +719,19 @@ end
 # Nearest discrete tap, except for a banded tap regulating toward an edge: the continuation left
 # it at the tap that puts its voltage on the edge, so the snap goes on in the direction it moved
 # (away from `anchor`) to the first level at or beyond it, the first position inside the band.
-function snap_to_discrete(d::BranchDevice, p::Float64)
+# A latched tap still exactly at its anchor (the clamp held it there) goes on in the direction
+# that corrects its voltage, −side·sign(g), given the continuation's gain `g` (GAP-068); without a
+# gain it takes the nearest level, as before.
+function snap_to_discrete(d::BranchDevice, p::Float64,
+    g::Union{Nothing, Float64} = nothing)
     pc = clamp(p, d.p_min, d.p_max)
     isempty(d.levels) && return pc       # a continuous phase shifter (NTP1 < 2)
     dir = 0
     if d.band && d.side != 0
         dir = Int(sign(pc - d.anchor))
+        if dir == 0 && !isnothing(g) && !iszero(g)
+            dir = -d.side * Int(sign(g))
+        end
     end
     if dir != 0
         return _directional_level(d, pc, dir)

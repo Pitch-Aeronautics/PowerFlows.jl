@@ -1166,7 +1166,7 @@ function _control_continuation!(
             MAX_CONTROL_PASSES_PER_STAGE=$(MAX_CONTROL_PASSES_PER_STAGE) passes \
             (S=$S); regulation may be loose at time step $ts"
     end
-    ok = snap_and_restore!(pf, data, set, ts, scratch_snap, dVdp; kwargs...)
+    ok = snap_and_restore!(pf, data, set, ts, scratch_snap, dVdp, frozen; kwargs...)
     # Regulating continuous devices (shunts, FACTS) end on their target exactly, or at a limit.
     ok && _continuous_finish!(pf, data, set, ts, scratch_snap, frozen, dVdp, n_shared,
         n_taps; kwargs...)
@@ -1343,7 +1343,12 @@ end
 # returning the pre-snap continuous values index-aligned with `devices` for the restore
 # path. (Index alignment, not name keying: device names are only unique per concrete
 # type, and a cross-family collision must not cross the stashed values.)
-function _snap_device_group!(devices, data, ts::Int)
+_snap_with_gain(d::BranchDevice, p::Float64, g) = snap_to_discrete(d, p, g)
+_snap_with_gain(d, p::Float64, _) = snap_to_discrete(d, p)
+
+# `dVdp` (indexed [taps; shunts; facts; phase shifters], `goffset` this group's offset) orients
+# the snap of a latched tap still at its anchor (see `snap_to_discrete`).
+function _snap_device_group!(devices, data, ts::Int, dVdp = nothing, goffset::Int = 0)
     cont = Vector{Float64}(undef, length(devices))
     for (i, d) in enumerate(devices)
         cont[i] = d.current
@@ -1356,7 +1361,8 @@ function _snap_device_group!(devices, data, ts::Int)
             d.current == d.initial || apply_parameter!(d, data, d.initial, ts)
             continue
         end
-        apply_parameter!(d, data, snap_to_discrete(d, d.current), ts)
+        g = _settle_gain(dVdp, goffset + i)
+        apply_parameter!(d, data, _snap_with_gain(d, d.current, g), ts)
     end
     return cont
 end
@@ -1390,8 +1396,13 @@ end
 # a warning.
 function _band_settle!(
     pf, data, set::ControlledDeviceSet, ts::Int, snap::ControlStateSnapshot,
-    dVdp::Union{Nothing, Vector{Float64}} = nothing; kwargs...,
+    dVdp::Union{Nothing, Vector{Float64}} = nothing,
+    frozen::Union{Nothing, Vector{Bool}} = nothing; kwargs...,
 )
+    # A held device (side 0) that the snap's solve left outside its band latches there, at its
+    # position, so the forward walk steps it (GAP-068): PSS/E moves any banded device whose
+    # voltage is outside at the end. Counted before the early return below.
+    _latch_pushed_out!(set, data, ts, frozen)
     (any(_band_latched, set.taps) || any(_band_latched, set.shunts) ||
      any(_band_latched, set.phase_shifters)) || return
     n = length(set.taps) + length(set.shunts) + length(set.phase_shifters)
@@ -1402,7 +1413,7 @@ function _band_settle!(
         maximum(d -> length(d.levels), set.shunts; init = 0),
         maximum(d -> length(d.levels), set.phase_shifters; init = 0),
     )
-    _band_forward!(pf, data, set, ts, snap, prev, moved, rounds; kwargs...) || return
+    _band_forward!(pf, data, set, ts, snap, prev, moved, rounds, dVdp; kwargs...) || return
     positions() = vcat(Float64[d.current for d in set.taps],
         Float64[d.current for d in set.shunts],
         Float64[d.current for d in set.phase_shifters])
@@ -1410,7 +1421,8 @@ function _band_settle!(
         before = positions()
         _band_back_off!(pf, data, set, ts, snap, prev, moved, rounds, dVdp; kwargs...) ||
             return
-        _band_forward!(pf, data, set, ts, snap, prev, moved, rounds; kwargs...) || return
+        _band_forward!(pf, data, set, ts, snap, prev, moved, rounds, dVdp; kwargs...) ||
+            return
         positions() == before && return
     end
     return
@@ -1420,6 +1432,39 @@ _band_latched(d::ControlledTap) = d.band && d.side != 0
 _band_latched(d::ControlledPhaseShifter) = d.band && d.side != 0 && !isempty(d.levels)
 _band_latched(d::ControlledSwitchedShunt) = d.band && d.side != 0 && !d.continuous
 _band_direction(d::BandedDevice) = Int(sign(d.current - d.anchor))
+
+# The direction that moves a latched device's regulated quantity back toward its band, as
+# `_can_correct` reads it: a discrete shunt raises its voltage by stepping up; a tap or phase
+# shifter steps −side·sign(g), g the continuation's (oriented) gain. Without a gain, the
+# direction it moved from its anchor.
+_correcting_direction(d::ControlledSwitchedShunt, ::Union{Nothing, Float64}) = -d.side
+function _correcting_direction(d::BranchDevice, g::Union{Nothing, Float64})
+    (isnothing(g) || iszero(g)) && return _band_direction(d)
+    return -d.side * Int(sign(g))
+end
+
+# Latch every held, unfrozen banded device of a group whose regulated quantity is outside its
+# band: side ±1, anchor at its position. `frozen` is indexed as `dVdp`.
+function _latch_pushed_out_group!(devices, goffset::Int, data, ts::Int, frozen)
+    for (i, d) in enumerate(devices)
+        (_band_capable(d) && d.side == 0) || continue
+        !isnothing(frozen) && frozen[goffset + i] && continue
+        y = measured_value(d, data, ts)
+        lo, hi = band_edges(d)
+        if y < lo - CONTROL_TAP_BAND_TOL
+            d.side, d.anchor = -1, d.current
+        elseif y > hi + CONTROL_TAP_BAND_TOL
+            d.side, d.anchor = 1, d.current
+        end
+    end
+    return
+end
+function _latch_pushed_out!(set::ControlledDeviceSet, data, ts::Int, frozen)
+    _latch_pushed_out_group!(set.taps, 0, data, ts, frozen)
+    _latch_pushed_out_group!(set.shunts, length(set.taps), data, ts, frozen)
+    _latch_pushed_out_group!(set.phase_shifters, _gain_pst_offset(set), data, ts, frozen)
+    return
+end
 
 # Move a banded device to level `lv` (a shunt also records that level's blocks).
 function _band_apply!(d::BandedDevice, data, lv::Float64, ts::Int)
@@ -1451,14 +1496,18 @@ function _band_round_failed!(data, set, ts, snap, prev, moved)
     return false
 end
 
-# One forward step of every latched device of a group still outside its band.
-function _band_forward_group!(devices, offset::Int, data, ts::Int, prev, moved)
+# One forward step of every latched device of a group still outside its band, in the direction
+# that corrects it (`_correcting_direction`; GAP-068: stepping away from the anchor walked a tap
+# snapped behind its anchor away from its band, to its limit). No step when no level lies that
+# way: a railed device stays, as PSS/E leaves it. `goffset` indexes `dVdp`.
+function _band_forward_group!(devices, offset::Int, data, ts::Int, prev, moved,
+    dVdp = nothing, goffset::Int = offset)
     # Measured before any step is applied (see `_apply_targets_group!`).
     outside = [_band_latched(d) && _outside_latched_side(d, measured_value(d, data, ts))
                for d in devices]
     for (i, d) in enumerate(devices)
         outside[i] || continue
-        dir = _band_direction(d)
+        dir = _correcting_direction(d, _settle_gain(dVdp, goffset + i))
         iszero(dir) && continue
         nxt = _next_level(d, dir)
         isnothing(nxt) && continue
@@ -1469,14 +1518,16 @@ function _band_forward_group!(devices, offset::Int, data, ts::Int, prev, moved)
     return
 end
 
-function _band_forward!(pf, data, set, ts, snap, prev, moved, rounds; kwargs...)
+function _band_forward!(pf, data, set, ts, snap, prev, moved, rounds, dVdp = nothing;
+    kwargs...)
     for _ in 1:rounds
         fill!(moved, false)
         _capture_state!(snap, data, ts)
-        _band_forward_group!(set.taps, 0, data, ts, prev, moved)
-        _band_forward_group!(set.shunts, length(set.taps), data, ts, prev, moved)
+        _band_forward_group!(set.taps, 0, data, ts, prev, moved, dVdp, 0)
+        _band_forward_group!(set.shunts, length(set.taps), data, ts, prev, moved, dVdp,
+            length(set.taps))
         _band_forward_group!(set.phase_shifters, _settle_pst_offset(set), data, ts, prev,
-            moved)
+            moved, dVdp, _gain_pst_offset(set))
         any(moved) || return true
         _ctrl_solve!(pf, data, ts; kwargs...) ||
             return _band_round_failed!(data, set, ts, snap, prev, moved)
@@ -1492,12 +1543,15 @@ function _band_back_group!(devices, offset::Int, data, ts::Int, prev, moved, act
         active[idx] || continue
         dir = _band_direction(d)
         back = _next_level(d, -dir)
-        lo, hi = parameter_limits(d)
-        # Never back past the anchor: the device latched there with its voltage outside.
-        if iszero(dir) || isnothing(back) || dir * (back - d.anchor) < -1e-9 * (hi - lo)
+        tol = _param_tol(d)
+        # Never back past the anchor: the device latched there with its voltage outside. A level
+        # within `_param_tol` of the anchor is the anchor (a stored ratio a few 1e-6 off its level
+        # by raw rounding, GAP-068), and the step lands on the anchor itself.
+        if iszero(dir) || isnothing(back) || dir * (back - d.anchor) < -tol
             active[idx] = false
             continue
         end
+        abs(back - d.anchor) < tol && (back = d.anchor)
         prev[idx] = d.current
         _band_apply!(d, data, back, ts)
         moved[idx] = true
@@ -1584,11 +1638,12 @@ function _band_solo_group!(pf, data, set, devices, offset::Int, ts::Int, snap, r
         end
         dir = _band_direction(d)
         back = _next_level(d, -dir)
-        lo, hi = parameter_limits(d)
-        if iszero(dir) || isnothing(back) || dir * (back - d.anchor) < -1e-9 * (hi - lo)
+        tol = _param_tol(d)
+        if iszero(dir) || isnothing(back) || dir * (back - d.anchor) < -tol
             retry[idx] = false
             continue
         end
+        abs(back - d.anchor) < tol && (back = d.anchor)
         p0 = d.current
         _capture_state!(snap, data, ts)
         _band_apply!(d, data, back, ts)
@@ -1687,7 +1742,8 @@ function snap_and_restore!(
     set::ControlledDeviceSet,
     ts::Int,
     scratch_snap::ControlStateSnapshot,
-    dVdp::Union{Nothing, Vector{Float64}} = nothing;
+    dVdp::Union{Nothing, Vector{Float64}} = nothing,
+    frozen::Union{Nothing, Vector{Bool}} = nothing;
     kwargs...,
 )::Bool
     # Last continuous converged state: the restore path must start from here, not from
@@ -1695,12 +1751,13 @@ function snap_and_restore!(
     # buffer because it stays live across the `_restore_one!` calls below, which reuse
     # `scratch_snap`.
     pre = _snapshot_state(data, ts)
-    cont_taps = _snap_device_group!(set.taps, data, ts)
-    cont_shunts = _snap_device_group!(set.shunts, data, ts)
-    cont_facts = _snap_device_group!(set.facts, data, ts)
-    cont_psts = _snap_device_group!(set.phase_shifters, data, ts)
+    n_taps, n_shunts = length(set.taps), length(set.shunts)
+    cont_taps = _snap_device_group!(set.taps, data, ts, dVdp, 0)
+    cont_shunts = _snap_device_group!(set.shunts, data, ts, dVdp, n_taps)
+    cont_facts = _snap_device_group!(set.facts, data, ts, dVdp, n_taps + n_shunts)
+    cont_psts = _snap_device_group!(set.phase_shifters, data, ts, dVdp, _gain_pst_offset(set))
     if _ctrl_solve!(pf, data, ts; kwargs...)
-        _band_settle!(pf, data, set, ts, scratch_snap, dVdp; kwargs...)
+        _band_settle!(pf, data, set, ts, scratch_snap, dVdp, frozen; kwargs...)
         return true
     end
     _restore_state!(data, ts, pre)

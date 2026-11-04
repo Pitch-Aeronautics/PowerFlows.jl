@@ -2107,7 +2107,7 @@ end
 
 # A latched below its band at one block above its anchor 0 (as the continuation leaves it),
 # B latched below its band at 0; then the band settle after a converged solve.
-function _railed_neighbour_settle(b_blocks)
+function _railed_neighbour_settle(b_blocks; settle::Bool = true)
     vx0, _ = _railed_neighbour_voltages(0.0)
     vx1, vy1 = _railed_neighbour_voltages(0.1)
     @test vx1 > vx0
@@ -2123,6 +2123,7 @@ function _railed_neighbour_settle(b_blocks)
     b.side, b.anchor = -1, 0.0
     @test PowerFlows._solve_with_q_limits!(pf, data, 1)
     @test PowerFlows._outside_latched_side(b, PowerFlows.measured_value(b, data, 1))
+    settle || return a, b, set, data
     PowerFlows._band_settle!(pf, data, set, 1, PowerFlows._snapshot_state(data, 1))
     va = PowerFlows.measured_value(a, data, 1)
     return a, b, va
@@ -2136,11 +2137,19 @@ end
     @test a.current == 0.0
     @test a.vset_lo <= va <= a.vset_hi
     @test b.current == 0.0
-    # B with a capacitor block above 0 could still correct, and A's step back lowers its
-    # voltage: the back-off is reverted, as before.
-    a, b, _ = _railed_neighbour_settle([-0.5, 0.1])
+    # B with a capacitor block above 0 can still correct: latched outside, it counts against a
+    # back-off ...
+    _, b, set, data = _railed_neighbour_settle([-0.5, 0.1]; settle = false)
     @test !isnothing(PowerFlows._next_level(b, 1))
-    @test a.current == 0.1
+    @test PowerFlows._any_latched_outside(set, data, 1)
+    # ... and the settle's forward walk steps it up, the direction that corrects it (GAP-068:
+    # before, a latched device still at its anchor took no forward step and vetoed A's back-off).
+    # Railed there, it no longer blocks A's step back to its anchor.
+    a, b, va = _railed_neighbour_settle([-0.5, 0.1])
+    @test b.current == 0.1
+    @test isnothing(PowerFlows._next_level(b, 1))
+    @test a.current == 0.0
+    @test a.vset_lo <= va <= a.vset_hi
 end
 
 @testset "band settle: which latched devices can still correct (GAP-030, unit)" begin
