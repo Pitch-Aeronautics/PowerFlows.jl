@@ -501,7 +501,7 @@ function _create_jacobian_matrix_structure(
 end
 
 function _set_entries_for_neighbor(::SparseArrays.SparseMatrixCSC{Float64, J_INDEX_TYPE},
-    Y_from_to::ComplexF32,
+    Y_from_to::YBUS_ELTYPE,
     Vm_from::Float64,
     Vm_to::Float64,
     θ_from_to::Float64,
@@ -526,7 +526,7 @@ function _set_entries_for_neighbor(::SparseArrays.SparseMatrixCSC{Float64, J_IND
 end
 
 function _set_entries_for_neighbor(Jv::SparseArrays.SparseMatrixCSC{Float64, J_INDEX_TYPE},
-    Y_from_to::ComplexF32,
+    Y_from_to::YBUS_ELTYPE,
     Vm_from::Float64,
     Vm_to::Float64,
     θ_from_to::Float64,
@@ -560,7 +560,7 @@ function _set_entries_for_neighbor(Jv::SparseArrays.SparseMatrixCSC{Float64, J_I
 end
 
 function _set_entries_for_neighbor(Jv::SparseArrays.SparseMatrixCSC{Float64, J_INDEX_TYPE},
-    Y_from_to::ComplexF32,
+    Y_from_to::YBUS_ELTYPE,
     Vm_from::Float64,
     Vm_to::Float64,
     θ_from_to::Float64,
