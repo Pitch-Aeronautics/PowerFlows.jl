@@ -1204,7 +1204,10 @@ function _snap_device_group!(devices, data, ts::Int)
         if abs(d.current - d.initial) < _param_tol(d)
             # Never moved (deadband-held or already regulated at enrollment): hold the
             # original setting. PSS/E keeps an in-band shunt at BINIT and an untouched
-            # tap at its parsed ratio even when that value is off the discrete grid.
+            # tap at its parsed ratio even when that value is off the discrete grid. The
+            # setting is restored exactly: a band latch released within `_param_tol` of its
+            # anchor leaves a sub-tolerance drift (up to ~2e-5 in ratio) that is not a move.
+            d.current == d.initial || apply_parameter!(d, data, d.initial, ts)
             continue
         end
         apply_parameter!(d, data, snap_to_discrete(d, d.current), ts)

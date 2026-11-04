@@ -1553,6 +1553,62 @@ end
     @test inner_mid > 10 * inner_band
 end
 
+# REF(1) ─tap B (1→2)─ 2 ─line─ 3 ─tap A (3→4)─ 4, loads at 2 and 4. A regulates bus 4 and sits
+# inside its band [VMI1, VMA1] at its parsed ratio; B regulates bus 2, below its band. B's moves
+# carry |V₄| out of A's band and back during the continuation, so A latches, steps, and retreats
+# to within `_param_tol` of its anchor (1.99e-5 off its ratio here before GAP-057's fix).
+function _in_band_drift_system(; tA = 1.0055)
+    sys = System(100.0)
+    b1 = _add_simple_bus!(sys, 1, ACBusTypes.REF, 230, 1.0, 0.0)
+    _add_simple_source!(sys, b1, 0.0, 0.0)
+    b2 = _add_simple_bus!(sys, 2, ACBusTypes.PQ, 230, 1.0, 0.0)
+    b3 = _add_simple_bus!(sys, 3, ACBusTypes.PQ, 230, 1.0, 0.0)
+    b4 = _add_simple_bus!(sys, 4, ACBusTypes.PQ, 115, 1.0, 0.0)
+    _add_simple_line!(sys, b2, b3, 0.01, 0.2146, 0.0)
+    _add_simple_load!(sys, b2, 12.4407, 31.5854)
+    _add_simple_load!(sys, b4, 44.2138, 9.1698)
+    for (nm, f, t, tap, lo, hi, x, reg) in (
+        ("A", b3, b4, tA, 0.9751, 1.0081, 0.0531, 4),
+        ("B", b1, b2, 0.919, 0.9994, 1.0194, 0.0858, 2))
+        add_component!(sys, TapTransformer(; name = nm, available = true,
+            active_power_flow = 0.0, reactive_power_flow = 0.0,
+            arc = Arc(; from = f, to = t), r = 0.002, x = x, primary_shunt = 0.0im,
+            tap = tap, rating = 1.0, base_power = 100.0,
+            control_objective = PSY.TransformerControlObjective.VOLTAGE,
+            voltage_setpoint = (lo + hi) / 2, regulated_bus_number = reg,
+            ext = Dict{String, Any}("VMI1" => lo, "VMA1" => hi)))
+    end
+    return sys
+end
+
+@testset "tap band: an in-band tap ends bit-equal to its parsed ratio (GAP-057)" begin
+    pf = ACPolarPowerFlow(; control_discrete_devices = true)
+    data = PowerFlowData(pf, _in_band_drift_system())
+    @test solve_power_flow!(data)
+    taps = Dict(d.name => d for d in PF.get_controlled_devices(data).taps)
+    A, B = taps["A"], taps["B"]
+    @test B.current != B.initial                       # B regulated
+    @test A.current === A.initial === 1.0055           # A held exactly at its parsed ratio
+    vA = data.bus_magnitude[A.controlled_ix, 1]
+    @test A.v_lo - PowerFlows.CONTROL_TAP_BAND_TOL <= vA <= A.v_hi
+    # The solved network is the one with A at its parsed ratio and B where it ended.
+    sys_fixed = _in_band_drift_system()
+    set_tap!(get_component(TapTransformer, sys_fixed, "B"), B.current)
+    fixed = PowerFlowData(ACPolarPowerFlow(), sys_fixed)
+    @test solve_power_flow!(fixed)
+    @test data.bus_magnitude[:, 1] ≈ fixed.bus_magnitude[:, 1] atol = 1e-8
+    # Unit: a sub-tolerance drift is undone by the snap, and the Y-bus block goes back.
+    data2 = PowerFlowData(pf, _in_band_drift_system())
+    set2 = PF.get_controlled_devices(data2)
+    d = only(filter(t -> t.name == "A", set2.taps))
+    A0 = copy(data2.power_network_matrix.data.nzval[collect(d.nz_offsets)])
+    PowerFlows.apply_parameter!(d, data2, d.initial + 0.5 * PowerFlows._param_tol(d), 1)
+    cont = PowerFlows._snap_device_group!(set2.taps, data2, 1)
+    @test d.current === d.initial
+    @test cont[findfirst(==(d), set2.taps)] != d.initial    # the restore path keeps the drift
+    @test data2.power_network_matrix.data.nzval[collect(d.nz_offsets)] ≈ A0 rtol = 1e-14
+end
+
 # ── PSS/E voltage band [VSWLO, VSWHI] for switched shunts ───────────────────────────────────
 # REF(1) ─ line(0.01 + j0.2) ─ PQ(3) with a 30 MW / 100q MVAr load and a switched shunt at bus 3
 # (|V₃| ≈ 0.930 with no shunt at q = 0.3; each 0.05 p.u. of capacitance adds ≈ 0.01 p.u.). The
