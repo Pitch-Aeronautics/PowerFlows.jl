@@ -89,8 +89,21 @@ end
     return y, -y * _correction_factor_slope(curve, abs(p)) * sign(p) / F
 end
 
-"""Voltage-controlling switched shunt, snapped onto the PSS/E cumulative
-block-activation chain (blocks switch on in listed order, off in reverse)."""
+"""Voltage-controlling switched shunt (PSS/E MODSW 1 discrete, 2 continuous).
+
+`levels` are the realizable total susceptances in ascending order and `level_blocks[k, :]`
+the per-block step counts that realize `levels[k]` (see [`_shunt_levels`](@ref)): with PSS/E
+`ADJM = 0` the cumulative block-activation chains (capacitor blocks switch on in listed order,
+reactor blocks likewise, each off in reverse), with `ADJM = 1` every combination of steps, so a
+step goes to the next higher or lower total admittance.
+
+Voltage band (PSS/E `[VSWLO, VSWHI]`, `vset_lo`/`vset_hi`): the shunt is held while its
+regulated voltage is inside. With `band` set, one outside latches the violated edge (`side`
+−1 below, +1 above, `anchor` the susceptance where it latched), regulates toward it, and a
+discrete shunt stops at the first level inside (directional snap, then `_band_settle!`); a
+continuous one ends on the edge. Without `band` (`shunt_voltage_band = false`, the rule before
+the band was implemented) it regulates toward `vset`, the band midpoint, is held as soon as its
+voltage crosses into the band, and snaps to the nearest level."""
 mutable struct ControlledSwitchedShunt <: AbstractShuntControl
     name::String
     bus_ix::Int
@@ -111,6 +124,100 @@ mutable struct ControlledSwitchedShunt <: AbstractShuntControl
     psse_convention::Bool            # true ⇒ PSS/E parser convention (Y=BINIT total,
     # initial_status zeroed); false ⇒ PSY API convention (Y is the fixed base,
     # initial_status meaningful). Determines how write_device_settings! sources Y/status.
+    levels::Vector{Float64}          # realizable totals, ascending
+    level_blocks::Matrix{Int}        # level_blocks[k, j]: steps of block j at levels[k]
+    band::Bool                       # PSS/E band: first level inside; false ⇒ midpoint rule
+    side::Int                        # latched violation: −1 below, +1 above, 0 none
+    anchor::Float64                  # susceptance where the current latch began
+end
+
+# Positional form without the level table and band (unit tests, older callers): the PSS/E
+# ADJM = 0 chains, and the midpoint rule.
+ControlledSwitchedShunt(
+    name, bus_ix, controlled_ix, vset, vset_lo, vset_hi, g0, b0, block_steps, block_dB,
+    b_min, b_max, block_n, continuous, initial, current, psse_convention,
+) = ControlledSwitchedShunt(
+    name, bus_ix, controlled_ix, vset, vset_lo, vset_hi, g0, b0, block_steps, block_dB,
+    b_min, b_max, block_n, continuous, initial, current, psse_convention,
+    _shunt_levels(b0, block_steps, block_dB, 0)..., false, 0, current,
+)
+
+"""`(levels, level_blocks)` of a switched shunt with fixed base `b0`: the realizable total
+susceptances in ascending order and, row by row, the per-block step counts that realize them.
+
+- `adjm = 0` (PSS/E ADJM 0, the only method before PSS/E 32): blocks switch on in input order
+  and off in reverse. Capacitor blocks (dB > 0) and reactor blocks (dB < 0) form two chains
+  stepping away from the all-off base, so the totals are `b0`, `b0` plus each capacitor
+  prefix and `b0` plus each reactor prefix. PSS/E lists reactor blocks first, then capacitor
+  blocks; the chains are taken by sign, so a bank listed otherwise keeps each sign's order.
+- `adjm = 1` (PSS/E ADJM 1): steps and blocks switch so that the next higher (or lower) total
+  admittance is reached: every combination of steps, each distinct total once, realized by the
+  combination with the fewest steps switched on. Above `CONTROL_SHUNT_MAX_COMBINATIONS`
+  combinations it falls back to the ADJM 0 chains with a warning."""
+function _shunt_levels(b0::Float64, steps::Vector{Int}, dB::Vector{Float64}, adjm::Int;
+    name::String = "")
+    nb = length(steps)
+    if adjm == 1
+        ncomb = prod(big.(steps) .+ 1; init = big(1))
+        if ncomb <= CONTROL_SHUNT_MAX_COMBINATIONS
+            return _shunt_levels_by_total(b0, steps, dB)
+        end
+        @warn "ControlledSwitchedShunt \"$name\": ADJM 1 with $ncomb step combinations \
+            (over $CONTROL_SHUNT_MAX_COMBINATIONS); switching blocks in input order (ADJM 0)."
+    end
+    rows = Vector{Vector{Int}}()
+    totals = Float64[]
+    for positive in (false, true)
+        n = zeros(Int, nb)
+        total = b0
+        for k in 1:nb
+            (positive ? dB[k] > 0.0 : dB[k] < 0.0) || continue
+            for _ in 1:steps[k]
+                n[k] += 1
+                total += dB[k]
+                push!(totals, total)
+                push!(rows, copy(n))
+            end
+        end
+    end
+    push!(totals, b0)
+    push!(rows, zeros(Int, nb))
+    return _sorted_levels(totals, rows, nb)
+end
+
+function _shunt_levels_by_total(b0::Float64, steps::Vector{Int}, dB::Vector{Float64})
+    nb = length(steps)
+    best = Dict{Float64, Vector{Int}}()
+    n = zeros(Int, nb)
+    while true
+        total = b0 + sum(n .* dB; init = 0.0)
+        key = round(total; digits = 12)
+        cur = get(best, key, nothing)
+        if isnothing(cur) || sum(n) < sum(cur)
+            best[key] = copy(n)
+        end
+        # Odometer over n[k] ∈ 0:steps[k].
+        k = 1
+        while k <= nb && n[k] == steps[k]
+            n[k] = 0
+            k += 1
+        end
+        k > nb && break
+        n[k] += 1
+    end
+    rows = collect(values(best))
+    totals = [b0 + sum(r .* dB; init = 0.0) for r in rows]
+    return _sorted_levels(totals, rows, nb)
+end
+
+function _sorted_levels(totals::Vector{Float64}, rows::Vector{Vector{Int}}, nb::Int)
+    perm = sortperm(totals)
+    levels = totals[perm]
+    blocks = zeros(Int, length(levels), nb)
+    for (i, p) in enumerate(perm)
+        blocks[i, :] .= rows[p]
+    end
+    return levels, blocks
 end
 
 """Continuous shunt SVC/STATCOM (`FACTSControlDevice`). Holds `vset` at `controlled_ix`
@@ -343,11 +450,20 @@ stored_parameter_limits(set::ControlledDeviceSet, ::ControlledFACTS, i::Int, ts:
     (-set.facts_b_lim[i, ts], set.facts_b_lim[i, ts])
 
 voltage_setpoint(d::AbstractControlledDevice) = d.vset
-# A banded tap regulates toward the edge it latched on; otherwise toward `vset`.
-function control_setpoint(d::ControlledTap)
+
+# The two families with a PSS/E voltage band and a discrete grid: taps ([VMI1, VMA1]) and
+# switched shunts ([VSWLO, VSWHI]). The latch, clamp, directional snap and band settle below are
+# shared.
+const BandedDevice = Union{ControlledTap, ControlledSwitchedShunt}
+band_edges(d::ControlledTap) = (d.v_lo, d.v_hi)
+band_edges(d::ControlledSwitchedShunt) = (d.vset_lo, d.vset_hi)
+
+# A banded device regulates toward the edge it latched on; otherwise toward `vset`.
+function control_setpoint(d::BandedDevice)
     d.band || return d.vset
-    d.side < 0 && return d.v_lo
-    d.side > 0 && return d.v_hi
+    lo, hi = band_edges(d)
+    d.side < 0 && return lo
+    d.side > 0 && return hi
     return d.vset
 end
 parameter_limits(d::ControlledTap) = (d.p_min, d.p_max)
@@ -367,27 +483,33 @@ control_setpoint(d::AbstractControlledDevice) = voltage_setpoint(d)
 stamp_control!(d::AbstractControlledDevice, args...) =
     error("implicit embedding not implemented for $(typeof(d))")
 
-# PSS/E deadband semantics: a switched shunt is held while the controlled voltage is
-# anywhere INSIDE [VSWLO, VSWHI]; only excursions outside the band trigger switching.
-# A banded tap is held inside [VMI1, VMA1] unless it is already regulating toward an edge
-# (see `_update_band_state!`). FACTS devices carry a point setpoint and always regulate.
+# PSS/E deadband semantics: a banded tap ([VMI1, VMA1]) or switched shunt ([VSWLO, VSWHI]) is
+# held while its regulated voltage is inside its band, unless it is already regulating toward
+# an edge (see `_update_band_state!`). A shunt without `band` (the midpoint rule) is held
+# whenever its voltage is inside, including once it has crossed in. FACTS devices, and taps
+# without a band, carry a point setpoint and always regulate.
 _in_deadband(::AbstractControlledDevice, ::Float64) = false
-_in_deadband(d::ControlledSwitchedShunt, y::Float64) = d.vset_lo <= y <= d.vset_hi
+function _in_deadband(d::ControlledSwitchedShunt, y::Float64)
+    d.band && d.side != 0 && return false
+    return d.vset_lo <= y <= d.vset_hi
+end
 _in_deadband(d::ControlledTap, y::Float64) = d.band && d.side == 0 && d.v_lo <= y <= d.v_hi
 
-# Banded-tap latch, updated from the measured regulated voltage `y` before each damped move.
-# Below the band ⇒ latch −1 (regulate up to VMI1), above ⇒ +1 (down to VMA1), recording the tap
-# as `anchor`. A latched tap keeps regulating to its edge after crossing into the band, so the
-# continuation settles at the edge and the snap can take the first step inside (PSS/E stops at
-# the first tap position whose voltage is in the band). It is released, and held from then on,
-# when its voltage is inside the band while it still sits at its anchor: the band was reached
-# without it (other devices moved the voltage), or `_band_clamp` stopped its retreat there.
+# Band latch, updated from the measured regulated voltage `y` before each damped move.
+# Below the band ⇒ latch −1 (regulate up to the low edge), above ⇒ +1 (down to the high edge),
+# recording the parameter as `anchor`. A latched device keeps regulating to its edge after
+# crossing into the band, so the continuation settles at the edge and the snap can take the
+# first step inside (PSS/E stops at the first tap position, or shunt step, whose voltage is in
+# the band). It is released, and held from then on, when its voltage is inside the band while
+# it still sits at its anchor: the band was reached without it (other devices moved the
+# voltage), or `_band_clamp` stopped its retreat there.
 _update_band_state!(::AbstractControlledDevice, ::Float64) = nothing
-function _update_band_state!(d::ControlledTap, y::Float64)
+function _update_band_state!(d::BandedDevice, y::Float64)
     d.band || return
-    if y < d.v_lo
+    lo, hi = band_edges(d)
+    if y < lo
         d.side == -1 || (d.side = -1; d.anchor = d.current)
-    elseif y > d.v_hi
+    elseif y > hi
         d.side == 1 || (d.side = 1; d.anchor = d.current)
     elseif d.side != 0 && abs(d.current - d.anchor) < _param_tol(d)
         d.side = 0
@@ -399,7 +521,7 @@ end
 # outside the band, so moving back beyond where it latched would leave the band on the other
 # side of a position at which the voltage was already outside. `dvdp` orients the move.
 _band_clamp(::AbstractControlledDevice, p::Float64, ::Float64) = p
-function _band_clamp(d::ControlledTap, p::Float64, dvdp::Float64)
+function _band_clamp(d::BandedDevice, p::Float64, dvdp::Float64)
     (d.band && d.side != 0 && !iszero(dvdp)) || return p
     # Sign of the tap movement that moves the voltage from the violated side into the band.
     if -d.side * sign(dvdp) > 0
@@ -408,9 +530,9 @@ function _band_clamp(d::ControlledTap, p::Float64, dvdp::Float64)
     return min(p, d.anchor)
 end
 
-# A frozen device holds its parameter; a frozen tap is not regulating toward an edge.
+# A frozen device holds its parameter; a frozen banded device is not regulating toward an edge.
 _release_band!(::AbstractControlledDevice) = nothing
-_release_band!(d::ControlledTap) = (d.side = 0; nothing)
+_release_band!(d::BandedDevice) = (d.side = 0; nothing)
 
 function _nz_index(A::SparseArrays.SparseMatrixCSC, row::Int, col::Int)
     @inbounds for k in SparseArrays.nzrange(A, col)
@@ -486,25 +608,29 @@ function snap_to_discrete(d::ControlledTap, p::Float64)
 end
 
 # The first level at or beyond `p` in direction `dir` (+1 up, −1 down), within a hair of `p`;
-# the end level when none lies beyond (the tap limits hold).
-function _directional_level(d::ControlledTap, p::Float64, dir::Int)
-    eps = 1e-9 * (d.p_max - d.p_min)
+# the end level when none lies beyond (the parameter limits hold). `levels` ascend.
+_directional_level(d::BandedDevice, p::Float64, dir::Int) =
+    d.levels[_directional_level_index(d, p, dir)]
+function _directional_level_index(d::BandedDevice, p::Float64, dir::Int)
+    lo, hi = parameter_limits(d)
+    eps = 1e-9 * (hi - lo)
     if dir > 0
-        @inbounds for lv in d.levels
-            lv >= p - eps && return lv
+        @inbounds for k in eachindex(d.levels)
+            d.levels[k] >= p - eps && return k
         end
-        return d.levels[end]
+        return length(d.levels)
     end
     @inbounds for k in length(d.levels):-1:1
-        d.levels[k] <= p + eps && return d.levels[k]
+        d.levels[k] <= p + eps && return k
     end
-    return d.levels[1]
+    return 1
 end
 
-# The next level strictly beyond the tap's current level in direction `dir`, or `nothing` at a
-# tap limit.
-function _next_level(d::ControlledTap, dir::Int)
-    eps = 1e-9 * (d.p_max - d.p_min)
+# The next level strictly beyond the device's current level in direction `dir`, or `nothing`
+# at a limit.
+function _next_level(d::BandedDevice, dir::Int)
+    lo, hi = parameter_limits(d)
+    eps = 1e-9 * (hi - lo)
     if dir > 0
         @inbounds for lv in d.levels
             lv > d.current + eps && return lv
@@ -517,63 +643,63 @@ function _next_level(d::ControlledTap, dir::Int)
     return nothing
 end
 
-# Whether a banded tap's regulated voltage `y` is still outside its band on the side it latched.
-function _outside_latched_side(d::ControlledTap, y::Float64)
-    d.side < 0 && return y < d.v_lo - CONTROL_TAP_BAND_TOL
-    d.side > 0 && return y > d.v_hi + CONTROL_TAP_BAND_TOL
+# Whether a banded device's regulated voltage `y` is still outside its band on the side it
+# latched.
+function _outside_latched_side(d::BandedDevice, y::Float64)
+    lo, hi = band_edges(d)
+    d.side < 0 && return y < lo - CONTROL_TAP_BAND_TOL
+    d.side > 0 && return y > hi + CONTROL_TAP_BAND_TOL
     return false
 end
 
-# PSS/E mixed banks: capacitor blocks (dB>0) switch on cumulatively in listed order,
-# reactor blocks (dB<0) likewise — two independent chains stepping away from the
-# all-off base, NOT one serial chain, so a mixed bank reaches both signs. Realizable
-# totals = b0 ∪ {b0 + capacitor prefixes} ∪ {b0 + reactor prefixes}. Same-sign banks
-# reduce to the previous single-chain walk. O(Σ steps), allocation-free.
+# Discrete shunt: a level of `levels` (`_shunt_levels`: the PSS/E ADJM 0 block chains, or every
+# total for ADJM 1), recording its per-block step counts in `block_n`. A banded shunt regulating
+# toward an edge goes on in the direction it moved (away from `anchor`) to the first level at or
+# beyond its continuous value, the first level inside the band; otherwise the nearest level.
+# Continuous (MODSW 2) shunts clamp. Allocation-free.
 function snap_to_discrete(d::ControlledSwitchedShunt, b::Float64)
     d.continuous && return clamp(b, d.b_min, d.b_max)
     target = clamp(b, d.b_min, d.b_max)
-    best = d.b0
-    best_steps = 0
-    best_positive = true
-    @inbounds for positive in (true, false)
-        total = d.b0
-        steps_taken = 0
-        for k in eachindex(d.block_steps, d.block_dB)
-            dB = d.block_dB[k]
-            on_side = if positive
-                dB > 0.0
-            else
-                dB < 0.0
-            end
-            on_side || continue
-            for _ in 1:d.block_steps[k]
-                total += dB
-                steps_taken += 1
-                if abs(total - target) < abs(best - target)
-                    best = total
-                    best_steps = steps_taken
-                    best_positive = positive
-                end
-            end
-        end
+    dir = 0
+    if d.band && d.side != 0
+        dir = Int(sign(target - d.anchor))
     end
-    # Record the winning side's prefix in block_n; the other side's blocks are 0.
-    fill!(d.block_n, 0)
-    remaining = best_steps
-    @inbounds for k in eachindex(d.block_steps)
-        dB = d.block_dB[k]
-        on_winning_side = if best_positive
-            dB > 0.0
-        else
-            dB < 0.0
-        end
-        if on_winning_side
-            n = min(remaining, d.block_steps[k])
-            d.block_n[k] = n
-            remaining -= n
-        end
+    k = if dir != 0
+        _directional_level_index(d, target, dir)
+    else
+        _nearest_level_index(d.levels, target)
+    end
+    _record_blocks!(d, k)
+    return d.levels[k]
+end
+
+function _nearest_level_index(levels::Vector{Float64}, x::Float64)
+    best = 1
+    @inbounds for k in eachindex(levels)
+        abs(levels[k] - x) < abs(levels[best] - x) && (best = k)
     end
     return best
+end
+
+@inline function _record_blocks!(d::ControlledSwitchedShunt, k::Int)
+    @inbounds for j in eachindex(d.block_n)
+        d.block_n[j] = d.level_blocks[k, j]
+    end
+    return
+end
+
+# After a band-settle step: the shunt sits on a level, so record that level's blocks.
+_sync_blocks!(::AbstractControlledDevice) = nothing
+function _sync_blocks!(d::ControlledSwitchedShunt)
+    d.continuous && return
+    eps = 1e-9 * (d.b_max - d.b_min)
+    @inbounds for k in eachindex(d.levels)
+        if abs(d.levels[k] - d.current) <= eps
+            _record_blocks!(d, k)
+            return
+        end
+    end
+    return
 end
 
 # Effective |b| bound at the measured controlled-bus voltage (Q = b·V²). SVC is

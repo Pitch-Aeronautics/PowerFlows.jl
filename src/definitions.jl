@@ -31,6 +31,17 @@ const CONTROL_OSCILLATION_LIMIT = 3
 # A banded tap's regulated voltage counts as inside [VMI1, VMA1] within this margin (p.u.), so
 # a tap the continuation left exactly on an edge is not stepped on solver noise.
 const CONTROL_TAP_BAND_TOL = 1e-6
+# A switched shunt with PSS/E ADJM 1 (switch to the next higher or lower total admittance)
+# enumerates every combination of block steps once at enrollment; above this many it falls back
+# to ADJM 0's input-order chains (PSS/E allows 8 blocks of 9 steps, 10^8 combinations).
+const CONTROL_SHUNT_MAX_COMBINATIONS = 1 << 16
+# Back-off/forward sweeps of the band settle after the snap (`_band_settle!`).
+const CONTROL_BAND_SETTLE_SWEEPS = 4
+# Exact finish of a regulating continuous switched shunt (`_continuous_finish!`): Newton rounds
+# on its susceptance until its regulated voltage is this close to its target (p.u.), or the
+# step clamps at a limit.
+const CONTROL_FINISH_VTOL = 1e-9
+const CONTROL_FINISH_MAX_ROUNDS = 20
 # Post-solve saturation classification band for a continuous FACTS device: |V−vset| within
 # this is "at setpoint". A device pinned at its V-dependent susceptance bound with |V−vset|
 # above this is reported saturated (the homotopy analogue of a PV→PQ Q-limit release). Matches

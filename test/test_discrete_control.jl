@@ -1552,3 +1552,289 @@ end
     @test inner_band <= 3
     @test inner_mid > 10 * inner_band
 end
+
+# ── PSS/E voltage band [VSWLO, VSWHI] for switched shunts ───────────────────────────────────
+# REF(1) ─ line(0.01 + j0.2) ─ PQ(3) with a 30 MW / 100q MVAr load and a switched shunt at bus 3
+# (|V₃| ≈ 0.930 with no shunt at q = 0.3; each 0.05 p.u. of capacitance adds ≈ 0.01 p.u.). The
+# shunt is built as the PSS/E parser builds it: `Y` = BINIT, `initial_status` zeroed, `ext`
+# carrying MODSW and ADJM. `remote` adds a load bus 4 behind bus 3 and regulates it instead.
+function _banded_shunt_system(vlo, vhi; steps = [4, 2], dB = [0.05, 0.1], binit = 0.0,
+    q = 0.3, remote::Bool = false, adjm::Int = 0, continuous::Bool = false)
+    sys = System(100.0)
+    b1 = _add_simple_bus!(sys, 1, ACBusTypes.REF, 230, 1.0, 0.0)
+    b3 = _add_simple_bus!(sys, 3, ACBusTypes.PQ, 230, 1.0, 0.0)
+    _add_simple_source!(sys, b1, 0.0, 0.0)
+    _add_simple_line!(sys, b1, b3, 0.01, 0.2, 0.0)
+    _add_simple_load!(sys, b3, 30.0, 100q)
+    reg = 0
+    if remote
+        b4 = _add_simple_bus!(sys, 4, ACBusTypes.PQ, 230, 1.0, 0.0)
+        _add_simple_line!(sys, b3, b4, 0.01, 0.1, 0.0)
+        _add_simple_load!(sys, b4, 10.0, 10.0)
+        reg = 4
+    end
+    mode = if continuous
+        PSY.SwitchedAdmittanceControlMode.CONTINUOUS_VOLTAGE
+    else
+        PSY.SwitchedAdmittanceControlMode.DISCRETE_VOLTAGE
+    end
+    add_component!(sys, SwitchedAdmittance(; name = "sh3", available = true, bus = b3,
+        Y = binit * im, initial_status = zeros(Int, length(steps)),
+        number_of_steps = steps, Y_increase = dB .* im,
+        admittance_limits = (min = vlo, max = vhi), control_mode = mode,
+        regulated_bus_number = reg,
+        ext = Dict{String, Any}("MODSW" => continuous ? 2 : 1, "ADJM" => adjm)))
+    return sys
+end
+
+function _solve_banded_shunt(vlo, vhi; shunt_voltage_band::Bool = true, kw...)
+    sys = _banded_shunt_system(vlo, vhi; kw...)
+    pf = ACPolarPowerFlow(;
+        control_discrete_devices = true, shunt_voltage_band = shunt_voltage_band)
+    data = PowerFlowData(pf, sys)
+    @test solve_power_flow!(data)
+    d = only(PF.get_controlled_devices(data).shunts)
+    return d, data.bus_magnitude[d.controlled_ix, 1], data
+end
+
+# |V| at the regulated bus with the shunt fixed at susceptance `b` (no control).
+function _v_at_fixed_shunt(vlo, vhi, b; remote::Bool = false, kw...)
+    sys = _banded_shunt_system(vlo, vhi; kw..., remote = remote, binit = b)
+    data = PowerFlowData(ACPolarPowerFlow(), sys)
+    @test solve_power_flow!(data)
+    return data.bus_magnitude[PF.get_bus_lookup(data)[remote ? 4 : 3], 1]
+end
+
+# The level one step from `d.current` toward `d.initial`.
+function _level_back(d)
+    k = findfirst(==(d.current), d.levels)
+    return d.levels[k + (d.current > d.initial ? -1 : 1)]
+end
+
+@testset "shunt band: level tables follow PSS/E's block order (ADJM 0 and 1)" begin
+    # ADJM 0: capacitor and reactor chains by sign, each in input order, a reactor block listed
+    # after a capacitor block included.
+    levels, blocks = PowerFlows._shunt_levels(0.0, [2, 1, 3], [-0.05, 0.05, -0.1], 0)
+    @test levels ≈ [-0.4, -0.3, -0.2, -0.1, -0.05, 0.0, 0.05]
+    @test blocks[1, :] == [2, 0, 3]
+    @test blocks[3, :] == [2, 0, 1]
+    @test blocks[5, :] == [1, 0, 0]
+    @test blocks[6, :] == [0, 0, 0]
+    @test blocks[7, :] == [0, 1, 0]
+    # Input order matters for ADJM 0: block 2 (0.03) switches on only after block 1 (0.1).
+    levels0, _ = PowerFlows._shunt_levels(0.0, [1, 1], [0.1, 0.03], 0)
+    @test levels0 ≈ [0.0, 0.1, 0.13]
+    # ADJM 1: every total, the next higher or lower admittance; fewest steps per total.
+    levels1, blocks1 = PowerFlows._shunt_levels(0.0, [1, 1], [0.1, 0.03], 1)
+    @test levels1 ≈ [0.0, 0.03, 0.1, 0.13]
+    @test blocks1[2, :] == [0, 1]
+    levels2, blocks2 = PowerFlows._shunt_levels(0.0, [2, 1], [0.05, 0.1], 1)
+    @test levels2 ≈ [0.0, 0.05, 0.1, 0.15, 0.2]
+    @test blocks2[3, :] == [0, 1]                 # 0.1 by one step, not two
+    levelsm, _ = PowerFlows._shunt_levels(0.0, [1, 1], [-0.1, 0.05], 1)
+    @test levelsm ≈ [-0.1, -0.05, 0.0, 0.05]
+    # Over the combination cap: ADJM 0 with a warning.
+    big_steps = fill(9, 8)
+    @test_logs (:warn, r"ADJM 0") PowerFlows._shunt_levels(0.0, big_steps, fill(0.01, 8), 1)
+end
+
+@testset "shunt band: latch, deadband and directional snap (unit)" begin
+    d = PowerFlows.ControlledSwitchedShunt("s", 3, 3, 1.0, 0.98, 1.02, 0.0, 0.0,
+        [4, 2], [0.05, 0.1], 0.0, 0.4, zeros(Int, 2), false, 0.0, 0.0, false)
+    @test !d.band                                 # the positional form is the midpoint rule
+    d.band = true
+    @test d.levels ≈ [0.0, 0.05, 0.1, 0.15, 0.2, 0.3, 0.4]
+    @test PowerFlows._in_deadband(d, 1.0)
+    PowerFlows._update_band_state!(d, 0.95)       # below VSWLO: latch, regulate to it
+    @test d.side == -1
+    @test PowerFlows.control_setpoint(d) == 0.98
+    @test !PowerFlows._in_deadband(d, 0.99)       # latched: inside does not hold
+    @test PowerFlows._band_clamp(d, -0.1, 0.2) == 0.0   # never back past the anchor
+    # Snap goes on upward: 0.21 lies between 0.2 and 0.3.
+    @test PowerFlows.snap_to_discrete(d, 0.21) ≈ 0.3
+    @test d.block_n == [4, 1]
+    @test PowerFlows.snap_to_discrete(d, 0.5) ≈ 0.4
+    @test d.block_n == [4, 2]
+    d.current = 0.2
+    @test PowerFlows._next_level(d, 1) ≈ 0.3
+    d.current = 0.3
+    PowerFlows._sync_blocks!(d)
+    @test d.block_n == [4, 1]
+    # The midpoint rule snaps to the nearest level and holds once inside.
+    d.band = false
+    d.side = 0
+    @test PowerFlows.snap_to_discrete(d, 0.21) ≈ 0.2
+    @test PowerFlows._in_deadband(d, 0.99)
+    @test (@allocated PowerFlows.snap_to_discrete(d, 0.21)) == 0
+end
+
+@testset "shunt band: enrollment and options" begin
+    sys = _banded_shunt_system(0.98, 1.02; adjm = 1)
+    data = PowerFlowData(ACPolarPowerFlow(), sys)
+    bl = PF.get_bus_lookup(data)
+    d = only(PowerFlows.build_controlled_device_set(sys, bl, data.power_network_matrix).shunts)
+    @test d.band
+    @test (d.vset_lo, d.vset_hi) == (0.98, 1.02)
+    @test d.levels ≈ [0.0, 0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4]   # ADJM 1 totals
+    d_off = only(
+        PowerFlows.build_controlled_device_set(sys, bl, data.power_network_matrix;
+            shunt_voltage_band = false).shunts,
+    )
+    @test !d_off.band
+    @test d_off.levels ≈ [0.0, 0.05, 0.1, 0.15, 0.2, 0.3, 0.4]          # ADJM 0 chain
+    # A zero-width band is a setpoint: no band latch.
+    sys0 = _banded_shunt_system(0.99, 0.99)
+    d0 = only(PowerFlows.build_controlled_device_set(sys0, PF.get_bus_lookup(data),
+        PowerFlowData(ACPolarPowerFlow(), sys0).power_network_matrix).shunts)
+    @test !d0.band
+    @test d0.vset == 0.99
+    @test ACPolarPowerFlow().shunt_voltage_band
+    @test ACRectangularPowerFlow().shunt_voltage_band
+    @test ACMixedPowerFlow().shunt_voltage_band
+    @test !ACPolarPowerFlow(; shunt_voltage_band = false).shunt_voltage_band
+end
+
+@testset "shunt band: a shunt whose voltage is inside its band does not move" begin
+    v0 = _v_at_fixed_shunt(0.92, 0.95, 0.0)
+    @test 0.92 < v0 < 0.95
+    d, v, _ = _solve_banded_shunt(0.92, 0.95)
+    @test d.current == d.initial == 0.0
+    @test v ≈ v0 atol = 1e-8
+end
+
+@testset "shunt band: below the band, steps up and stops at the first step inside" begin
+    vlo, vhi = 0.98, 1.02
+    @test _v_at_fixed_shunt(vlo, vhi, 0.0) < vlo
+    d, v, _ = _solve_banded_shunt(vlo, vhi)
+    @test d.current in d.levels
+    @test d.current ≈ 0.3
+    @test d.block_n == [4, 1]                     # block 1 full, then one step of block 2
+    @test vlo <= v <= vhi
+    @test _v_at_fixed_shunt(vlo, vhi, _level_back(d)) < vlo
+    @test v ≈ _v_at_fixed_shunt(vlo, vhi, d.current) atol = 1e-8
+    # The midpoint rule held it where its voltage crossed in and snapped to the nearest
+    # level, here one step short: the bus ends below the band.
+    d_mid, v_mid, _ = _solve_banded_shunt(vlo, vhi; shunt_voltage_band = false)
+    @test d_mid.current ≈ 0.2
+    @test v_mid < vlo
+end
+
+@testset "shunt band: above the band, switches reactors in and stops at the first step inside" begin
+    vlo, vhi = 0.90, 0.92
+    kw = (steps = [3, 2], dB = [-0.05, 0.1])
+    @test _v_at_fixed_shunt(vlo, vhi, 0.0; kw...) > vhi
+    d, v, _ = _solve_banded_shunt(vlo, vhi; kw...)
+    @test d.current ≈ -0.1
+    @test d.block_n == [2, 0]
+    @test vlo <= v <= vhi
+    @test _v_at_fixed_shunt(vlo, vhi, _level_back(d); kw...) > vhi
+    d_mid, v_mid, _ = _solve_banded_shunt(vlo, vhi; shunt_voltage_band = false, kw...)
+    @test v_mid > vhi                             # midpoint rule: one step short again
+end
+
+@testset "shunt band: block order, reactors off before capacitors on; ADJM 1" begin
+    # BINIT has one reactor step in; the voltage is below the band, so the reactor comes out
+    # first, then the capacitor block's steps go in, in order.
+    kw = (steps = [2, 2], dB = [-0.05, 0.1], binit = -0.05)
+    vlo, vhi = 0.97, 1.0
+    d, v, _ = _solve_banded_shunt(vlo, vhi; kw...)
+    @test d.levels ≈ [-0.1, -0.05, 0.0, 0.1, 0.2]
+    @test d.current ≈ 0.2
+    @test d.block_n == [0, 2]
+    @test vlo <= v <= vhi
+    @test _v_at_fixed_shunt(vlo, vhi, 0.1; kw...) < vlo
+    # Two capacitor blocks, 0.15 then 0.1: ADJM 0 reaches 0.15 before 0.1 + 0.15, ADJM 1 also
+    # has 0.1 alone, the first total inside [0.95, 1.0].
+    kw1 = (steps = [1, 1], dB = [0.15, 0.1])
+    vlo, vhi = 0.95, 1.0
+    @test _v_at_fixed_shunt(vlo, vhi, 0.1; kw1...) >= vlo
+    d0, v0, _ = _solve_banded_shunt(vlo, vhi; adjm = 0, kw1...)
+    @test d0.current ≈ 0.15
+    @test d0.block_n == [1, 0]
+    d1, v1, _ = _solve_banded_shunt(vlo, vhi; adjm = 1, kw1...)
+    @test d1.current ≈ 0.1
+    @test d1.block_n == [0, 1]
+    @test vlo <= v1 <= vhi
+end
+
+@testset "shunt band: a remote regulated bus (SWREG) is held to the band the same way" begin
+    vlo, vhi = 0.93, 0.96
+    @test _v_at_fixed_shunt(vlo, vhi, 0.0; remote = true) < vlo
+    d, v, _ = _solve_banded_shunt(vlo, vhi; remote = true)
+    @test d.controlled_ix != d.bus_ix
+    @test d.current ≈ 0.2
+    @test vlo <= v <= vhi
+    @test _v_at_fixed_shunt(vlo, vhi, _level_back(d); remote = true) < vlo
+    # Inside at the initial susceptance: held.
+    d, _, _ = _solve_banded_shunt(0.85, 0.95; remote = true)
+    @test d.current == d.initial
+end
+
+# Six feeders off one REF bus, tied in a chain, each with a load and a capacitor bank that
+# starts out (|V| ≈ 0.91–0.94, below [0.98, 1.02]).
+function _multi_banded_shunt_system(n; vlo = 0.98, vhi = 1.02, levels = nothing)
+    sys = System(100.0)
+    b1 = _add_simple_bus!(sys, 1, ACBusTypes.REF, 230, 1.0, 0.0)
+    _add_simple_source!(sys, b1, 0.0, 0.0)
+    prev = b1
+    for k in 1:n
+        bk = _add_simple_bus!(sys, 10 + k, ACBusTypes.PQ, 230, 1.0, 0.0)
+        _add_simple_line!(sys, b1, bk, 0.01, 0.15 + 0.03k, 0.0)
+        k > 1 && _add_simple_line!(sys, prev, bk, 0.01, 0.2, 0.0)
+        _add_simple_load!(sys, bk, 20.0, 25.0)
+        b = isnothing(levels) ? 0.0 : levels[k]
+        add_component!(sys, SwitchedAdmittance(; name = "sh$k", available = true, bus = bk,
+            Y = b * im, initial_status = [0, 0], number_of_steps = [4, 2],
+            Y_increase = [0.05im, 0.1im], admittance_limits = (min = vlo, max = vhi),
+            control_mode = PSY.SwitchedAdmittanceControlMode.DISCRETE_VOLTAGE,
+            ext = Dict{String, Any}("MODSW" => 1, "ADJM" => 0)))
+        prev = bk
+    end
+    return sys
+end
+
+@testset "shunt band: several interacting shunts settle inside their bands" begin
+    n = 6
+    pf = ACPolarPowerFlow(; control_discrete_devices = true)
+    data = PowerFlowData(pf, _multi_banded_shunt_system(n))
+    @test solve_power_flow!(data)
+    set = PF.get_controlled_devices(data)
+    v = [data.bus_magnitude[d.controlled_ix, 1] for d in set.shunts]
+    @test all(0.98 .<= v .<= 1.02)
+    @test all(d.current in d.levels for d in set.shunts)
+    @test PF.get_control_batched_fallback_count(data) == 0
+    @test PF.get_control_inner_solve_count(data) <= 80
+    # No shunt can step back: with any one of them one level back toward where it started, the
+    # others as solved, some bus is below the band (its own, or a neighbour's: the shunts
+    # couple, so "first step inside" is minimal over single steps, not per bus).
+    solved = [d.current for d in set.shunts]
+    for k in 1:n
+        lv = copy(solved)
+        lv[k] = _level_back(set.shunts[k])
+        d_fix = PowerFlowData(ACPolarPowerFlow(), _multi_banded_shunt_system(n; levels = lv))
+        @test solve_power_flow!(d_fix)
+        bl = PF.get_bus_lookup(d_fix)
+        @test any(d_fix.bus_magnitude[bl[10 + j], 1] < 0.98 for j in 1:n)
+    end
+end
+
+@testset "continuous shunt: a zero-width band ends on its setpoint, or exactly at a limit" begin
+    kw = (steps = [4, 2], dB = [-0.05, 0.1], continuous = true)   # range [-0.2, 0.2]
+    for vset in (0.92, 0.95)
+        d, v, _ = _solve_banded_shunt(vset, vset; kw...)
+        @test d.b_min < d.current < d.b_max
+        @test abs(v - vset) < 1e-6
+    end
+    d, v, _ = _solve_banded_shunt(0.99, 0.99; kw...)    # beyond even 0.2 p.u. of capacitance
+    @test d.current == d.b_max
+    @test v < 0.99
+    d, v, _ = _solve_banded_shunt(0.88, 0.88; kw...)    # beyond 0.2 p.u. of reactance
+    @test d.current == d.b_min
+    @test v > 0.88
+    # A banded continuous shunt above its band ends on the violated edge.
+    d, v, _ = _solve_banded_shunt(0.90, 0.92; kw...)
+    @test abs(v - 0.92) < 1e-6
+    # Discrete shunts are not finished: a zero-width discrete one snaps to the nearest step.
+    d, v, _ = _solve_banded_shunt(0.95, 0.95; steps = [4, 2], dB = [-0.05, 0.1])
+    @test d.current in d.levels
+end

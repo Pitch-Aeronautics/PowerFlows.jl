@@ -167,6 +167,14 @@ function _shunt_susceptance_model(
     return b_fixed, current, b_min, b_max
 end
 
+"""PSS/E `ADJM` of a switched shunt (`ext`, from the PSS/E parser): 1 switches to the next
+higher or lower total admittance, 0 (the default, and for API-built shunts) in input order."""
+function _shunt_adjm(sa)
+    adjm = get(PSY.get_ext(sa), "ADJM", 0)
+    adjm isa Real || return 0
+    return Int(adjm) == 1 ? 1 : 0
+end
+
 """The PSS/E controlled-voltage band `[VMI1, VMA1]` of a parsed `TapTransformer`, or `nothing`.
 
 PowerSystems 5 keeps the band only in `ext` (the PSS/E parser's `VMI1`/`VMA1`) and stores its
@@ -199,7 +207,14 @@ modes) de-enroll the device with a `@warn` — the device stays at its current s
 `[VMI1, VMA1]` band: held while the regulated voltage is inside it, stepped toward it only when
 outside, stopping at the first discrete step inside (see `_tap_voltage_band`). `false` drives
 every tap to its `voltage_setpoint` (the band midpoint for parsed data), the behaviour before
-the band was implemented. Taps without a band always regulate to `voltage_setpoint`."""
+the band was implemented. Taps without a band always regulate to `voltage_setpoint`.
+
+`shunt_voltage_band = true` (the default) does the same for a voltage-controlling switched
+shunt and its `[VSWLO, VSWHI]` band (`admittance_limits`): held inside, stepped block by block
+toward the band when outside, stopping at the first step inside (a continuous MODSW 2 shunt
+ends on the violated edge), with the blocks in PSS/E's order (`ext["ADJM"]`, see
+[`_shunt_levels`](@ref)). `false` is the rule before: regulate toward the band midpoint, hold
+once inside, snap to the nearest step of the input-order chains."""
 function build_controlled_device_set(
     sys,
     bus_lookup::Dict{Int, Int},
@@ -207,6 +222,7 @@ function build_controlled_device_set(
     reverse_bus_search_map::Dict{Int, Int} = Dict{Int, Int}(),
     n_time_steps::Int = 1,
     tap_voltage_band::Bool = true,
+    shunt_voltage_band::Bool = true,
 )
     taps = ControlledTap[]
     correction_tables = _tap_correction_tables(sys)
@@ -327,6 +343,9 @@ function build_controlled_device_set(
         b_fixed, current_b, bmin, bmax = _shunt_susceptance_model(
             name, Y0, steps, dB, init_status)
         _validate_shunt(name, bmin, b_fixed, bmax, steps, dB) || continue
+        adjm = shunt_voltage_band ? _shunt_adjm(sa) : 0
+        levels, level_blocks = _shunt_levels(b_fixed, steps, dB, adjm; name = name)
+        band = shunt_voltage_band && lims.min < lims.max
         push!(
             shunts,
             ControlledSwitchedShunt(
@@ -347,6 +366,11 @@ function build_controlled_device_set(
                 current_b,   # initial (reporting)
                 current_b,   # current
                 _is_binit_shunt(init_status),   # psse_convention: true ⇒ parser/BINIT
+                levels,
+                level_blocks,
+                band,
+                0,           # side (continuation scratch)
+                current_b,   # anchor (continuation scratch)
             ),
         )
     end

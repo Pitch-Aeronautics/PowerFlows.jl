@@ -201,9 +201,15 @@ already caps ``\omega \le 1-\theta = 0.5``, and the guarantee is conditional on
 the plant gain measured at the base point remaining representative along the
 trajectory — it is a safeguard, not an unconditional convergence proof.
 
-**Deadband.** A switched shunt whose controlled voltage is anywhere inside its
-parsed `[VSWLO, VSWHI]` band is held, not driven toward the band midpoint —
-the PSS/E semantics. A voltage-controlling tap parsed from PSS/E keeps its
+**Deadband.** A switched shunt whose controlled voltage (local, or the remote
+SWREG bus) is anywhere inside its `[VSWLO, VSWHI]` band is held — the PSS/E
+semantics. One outside latches the violated edge and regulates toward it; a
+discrete (MODSW 1) shunt then stops at the first block step inside the band, the
+steps taken in PSS/E's order (see the snap below), and a continuous (MODSW 2)
+shunt ends on the edge. `shunt_voltage_band = false` restores the earlier rule:
+regulate toward the band midpoint, hold as soon as the voltage crosses in, snap
+to the nearest step (which can leave the bus one step short of the band). A
+zero-width band (`VSWLO == VSWHI`) is a setpoint. A voltage-controlling tap parsed from PSS/E keeps its
 `[VMI1, VMA1]` band (`ext`, while `voltage_setpoint` is still its midpoint): it
 is held while its regulated voltage (local or remote) lies inside the band; one
 outside latches the violated edge, regulates toward it, and the snap then takes
@@ -258,14 +264,28 @@ After the continuous outer loop converges (or reaches its iteration limit),
   - **Tap.** The continuous parameter is snapped to the nearest value in the
     pre-computed `levels` vector (a uniform grid of `NTP` tap positions from
     `p_min` to `p_max`).
-  - **Shunt.** The target susceptance is snapped to the nearest point of the
-    PSS/E cumulative block-activation chain: blocks switch on in listed order
-    (and off in reverse), so the physically realizable totals are exactly the
-    prefix sums of the block steps. Walking that chain is simultaneously
-    optimal over the realizable set and order-respecting; `block_n` records
-    the chosen per-block step counts, and `snap_to_discrete` makes no heap
-    allocations. (Continuous devices — MODSW=2 shunts, FACTS — clamp instead
-    of snapping.)
+  - **Shunt.** The target susceptance is snapped onto the shunt's `levels`, the
+    realizable totals built once at enrollment (`_shunt_levels`). With PSS/E
+    `ADJM = 0` blocks switch on in listed order and off in reverse, capacitor
+    and reactor blocks each forming a chain away from the all-off base, so the
+    totals are the prefix sums of each chain; with `ADJM = 1` every combination
+    of steps is a level, so a step goes to the next higher or lower total
+    admittance. A banded shunt regulating toward an edge snaps on in the
+    direction it moved to the first level beyond its continuous value;
+    otherwise the nearest level. `block_n` records the per-block step counts,
+    and `snap_to_discrete` makes no heap allocations. (Continuous devices —
+    MODSW=2 shunts, FACTS — clamp instead of snapping.)
+  - **Band settle.** For banded taps and discrete shunts the snapped network is
+    then checked: a device still outside on its latched side steps on, one
+    whose step back toward its anchor would still be inside steps back (jointly,
+    then alone for devices that pushed each other out), and a final forward
+    pass, so each device ends at its first position inside.
+  - **Continuous finish.** A regulating continuous shunt (zero-width band, or
+    latched on an edge) then takes Newton steps on its susceptance, with one
+    joint solve per round, until its voltage is within `CONTROL_FINISH_VTOL`
+    of its target or the step clamps at a susceptance limit, where it then
+    sits exactly. Without it the sigmoid law's finite steepness leaves such a
+    device ~1e-4 p.u. off its setpoint, or short of the limit it is pinned at.
 
 After snapping all devices, the inner solver is called on the discretized
 network. If it converges, the procedure is complete. If not, each device is
@@ -330,6 +350,8 @@ Setpoints outside `[0.5, 1.5]` p.u. de-enroll the device with a warning.
 | Voltage setpoint  | midpoint of `get_admittance_limits` — the VSWLO/VSWHI band for parsed systems                                    |
 | Susceptance range | spanned by the blocks: `[Σ min(steps·dB, 0), Σ max(steps·dB, 0)]` (plus the fixed base for API-built components) |
 | Block structure   | `get_number_of_steps`, `get_Y_increase`, `get_initial_status`                                                    |
+| Voltage band      | `get_admittance_limits` = `[VSWLO, VSWHI]` (with `shunt_voltage_band`, the default)                              |
+| Block order       | `ext["ADJM"]`: 0 (default) ⇒ input order, by sign; 1 ⇒ next higher/lower total admittance                        |
 
 Two `Y`/`initial_status` conventions exist and are auto-detected via the
 presence of the parser's `MODSW` key: the **PSS/E parser** stores

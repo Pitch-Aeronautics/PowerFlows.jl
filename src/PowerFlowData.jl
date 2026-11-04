@@ -641,6 +641,7 @@ function _build_controlled_devices(
         reverse_bus_search_map = PNM.get_reverse_bus_search_map(nrd),
         n_time_steps = n_time_steps,
         tap_voltage_band = get_tap_voltage_band(pf),
+        shunt_voltage_band = get_shunt_voltage_band(pf),
     )
     if isempty(set)
         return nothing
