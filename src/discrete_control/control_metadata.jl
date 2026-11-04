@@ -453,8 +453,68 @@ function build_controlled_device_set(
 
     facts = ControlledFACTS[]
     _enroll_facts!(facts, sys, bus_lookup, reverse_bus_search_map)
+    _share_regulated_setpoints!(shunts, taps, facts, sys, bus_lookup,
+        reverse_bus_search_map; band = shunt_voltage_band)
 
     return ControlledDeviceSet(taps, shunts, facts, n_time_steps)
+end
+
+"""The bus a generator regulates remotely, by PSS/E's IREG, or `nothing`. PowerSystems has no
+field for it (a generator holds its own terminal); the PSS/E parser keeps IREG in `ext` (v33),
+and `ext["psse"]["IREG"]` (or `"ireg"`) is read too. 0 or the unit's own bus is local."""
+function _generator_remote_bus(g)
+    ext = PSY.get_ext(g)
+    r = get(ext, "IREG", nothing)
+    if !(r isa Real)
+        psse = get(ext, "psse", nothing)
+        r = psse isa AbstractDict ? get(psse, "IREG", get(psse, "ireg", nothing)) : nothing
+    end
+    (r isa Real && !iszero(r)) || return nothing
+    r = Int(r)
+    r == PSY.get_number(PSY.get_bus(g)) && return nothing
+    return r
+end
+
+"""Shared regulated buses (GAP-056). A continuous switched shunt with a point setpoint
+(VSWLO = VSWHI) whose regulated bus is also regulated by another enrolled device (a tap, shunt
+or FACTS) or by a generator by IREG (`_generator_remote_bus`) is given a hold band of
+±`CONTROL_SHARED_SETPOINT_BAND` around its setpoint: it keeps its stored susceptance while the
+voltage is inside, and outside it regulates to the nearer edge and ends there (the band rule of
+a banded continuous shunt).
+
+Why: with a point setpoint the sigmoid law drives every such shunt to the susceptance its
+voltage error maps to, whatever it stored, and the exact finish then puts the bus on its
+setpoint. A bus held by several devices is over-determined that way: two shunts on one bus
+were pulled to a common position (5 MVAr each with no voltage error at all), and a shunt
+sharing its bus with a remote-regulating generator, which PowerFlows models as holding its own
+terminal, took the generator's part, a large ΔB for a ~1e-4 p.u. error. PSS/E adjusts a
+switched shunt only while its voltage is off setpoint; with another device holding the bus
+there, it stays. Under the band the stored split is kept, and a device still acts when the
+others cannot hold the bus."""
+function _share_regulated_setpoints!(shunts, taps, facts, sys, bus_lookup,
+    reverse_bus_search_map; band::Bool = true)
+    any(d -> d.continuous && d.vset_lo == d.vset_hi, shunts) || return
+    counts = Dict{Int, Int}()
+    _count_controlled_buses!(counts, taps)
+    _count_controlled_buses!(counts, shunts)
+    _count_controlled_buses!(counts, facts)
+    for g in PSY.get_available_components(PSY.Generator, sys)
+        r = _generator_remote_bus(g)
+        isnothing(r) && continue
+        rix = _resolve_bus_ix(bus_lookup, reverse_bus_search_map, r)
+        isnothing(rix) || (counts[rix] = get(counts, rix, 0) + 1)
+    end
+    δ = CONTROL_SHARED_SETPOINT_BAND
+    for d in shunts
+        (d.continuous && d.vset_lo == d.vset_hi) || continue
+        get(counts, d.controlled_ix, 0) > 1 || continue
+        d.vset_lo = d.vset - δ
+        d.vset_hi = d.vset + δ
+        d.band = band
+        @debug "ControlledSwitchedShunt $(d.name): regulated bus shared with another \
+            device; held within ±$δ p.u. of its setpoint."
+    end
+    return
 end
 
 # Continuous shunt FACTS (SVC/STATCOM) voltage control. `rating` (SHMX) bounds the SVC

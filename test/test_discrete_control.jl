@@ -1963,3 +1963,106 @@ end
     @test f_warm.current ≈ f_cold.current rtol = 1e-6
     @test PF.get_control_inner_solve_count(warm) < n_cold
 end
+
+# ── Shared regulated bus (GAP-056) ──────────────────────────────────────────────────────────
+# REF(1) ─ G(2) ─ X(3) ─ Y(4). A generator at G holds its own terminal (PV, |V| = 1.0); with
+# `ireg` its `ext` names X as the bus it regulates in PSS/E (IREG), which PowerSystems cannot
+# represent. Continuous MODSW 2 shunts with a point setpoint `vset` (VSWLO = VSWHI): "X_Z2" at X
+# (`strong`) and "Y_Z2" at Y regulating X remotely (`weak`), as the PSS/E parser builds them.
+function _shared_bus_system(; vset = 1.0, ireg = false, strong = true, weak = true,
+    bx = 0.2, by = 0.1)
+    sys = System(100.0)
+    b1 = _add_simple_bus!(sys, 1, ACBusTypes.REF, 230, 1.0, 0.0)
+    _add_simple_source!(sys, b1, 0.0, 0.0)
+    bg = _add_simple_bus!(sys, 2, ACBusTypes.PV, 230, 1.0, 0.0)
+    bx_ = _add_simple_bus!(sys, 3, ACBusTypes.PQ, 230, 1.0, 0.0)
+    by_ = _add_simple_bus!(sys, 4, ACBusTypes.PQ, 230, 1.0, 0.0)
+    _add_simple_line!(sys, b1, bg, 0.005, 0.05, 0.0)
+    _add_simple_line!(sys, bg, bx_, 0.005, 0.05, 0.0)
+    _add_simple_line!(sys, bx_, by_, 0.01, 0.3, 0.0)
+    _add_simple_load!(sys, bx_, 60.0, 40.0)
+    _add_simple_load!(sys, by_, 10.0, 5.0)
+    g = _add_simple_thermal_standard!(sys, bg, 0.5, 0.0)
+    set_reactive_power_limits!(g, (min = -3.0, max = 3.0))
+    ireg && (get_ext(g)["IREG"] = 3)
+    for (nm, bus, b, reg, on) in (("X_Z2", bx_, bx, 0, strong), ("Y_Z2", by_, by, 3, weak))
+        on || continue
+        add_component!(sys, SwitchedAdmittance(; name = nm, available = true, bus = bus,
+            Y = b * im, initial_status = [0], number_of_steps = [1], Y_increase = [0.5im],
+            admittance_limits = (min = vset, max = vset),
+            control_mode = PSY.SwitchedAdmittanceControlMode.CONTINUOUS_VOLTAGE,
+            regulated_bus_number = reg,
+            ext = Dict{String, Any}("MODSW" => 2, "ADJM" => 0, "RMPCT" => 100.0)))
+    end
+    return sys
+end
+
+# |V_X| and the generator's Q with every shunt at its stored susceptance (no control).
+function _shared_bus_stored(; kw...)
+    data = PowerFlowData(ACPolarPowerFlow(), _shared_bus_system(; kw...))
+    @test solve_power_flow!(data)
+    bl = PF.get_bus_lookup(data)
+    return data.bus_magnitude[bl[3], 1], data.bus_reactive_power_injections[bl[2], 1]
+end
+
+function _shared_bus_solve(; kw...)
+    data = PowerFlowData(ACPolarPowerFlow(; control_discrete_devices = true),
+        _shared_bus_system(; kw...))
+    @test solve_power_flow!(data)
+    bl = PF.get_bus_lookup(data)
+    sh = Dict(d.name => d for d in PF.get_controlled_devices(data).shunts)
+    return sh, data.bus_magnitude[bl[3], 1], data.bus_reactive_power_injections[bl[2], 1]
+end
+
+@testset "shared regulated bus: enrollment gives a shared point setpoint a hold band (GAP-056)" begin
+    δ = PowerFlows.CONTROL_SHARED_SETPOINT_BAND
+    for (kw, shared) in (((; weak = false), false), ((; weak = false, ireg = true), true),
+        ((;), true))
+        sys = _shared_bus_system(; kw...)
+        data = PowerFlowData(ACPolarPowerFlow(), sys)
+        set = PowerFlows.build_controlled_device_set(sys, PF.get_bus_lookup(data),
+            data.power_network_matrix)
+        for d in set.shunts
+            @test (d.vset_hi - d.vset_lo ≈ 2δ) == shared
+            @test d.band == shared
+            @test d.vset == 1.0
+        end
+    end
+    g = only(get_components(ThermalStandard, _shared_bus_system(; ireg = true)))
+    @test PowerFlows._generator_remote_bus(g) == 3
+    get_ext(g)["IREG"] = 2                      # its own bus: local
+    @test isnothing(PowerFlows._generator_remote_bus(g))
+    delete!(get_ext(g), "IREG")
+    get_ext(g)["psse"] = Dict{String, Any}("ireg" => 3)
+    @test PowerFlows._generator_remote_bus(g) == 3
+end
+
+@testset "shared regulated bus: a shunt beside a remote-regulating generator keeps its setting (GAP-056)" begin
+    v0, q0 = _shared_bus_stored(; strong = false)
+    vset = round(v0 + 2e-4; digits = 6)     # the stored state misses the setpoint by 2e-4
+    # Sole regulator: it ends on its setpoint, as before, taking the generator's part.
+    sh, v, q = _shared_bus_solve(; strong = false, vset = vset)
+    @test abs(v - vset) < 1e-6
+    @test sh["Y_Z2"].current > sh["Y_Z2"].initial
+    # The generator regulates X by IREG: held at its stored susceptance, generator Q unchanged.
+    sh, v, q = _shared_bus_solve(; strong = false, ireg = true, vset = vset)
+    @test sh["Y_Z2"].current == sh["Y_Z2"].initial
+    @test v ≈ v0 atol = 1e-8
+    @test q ≈ q0 atol = 1e-8
+end
+
+@testset "shared regulated bus: two shunts on one bus keep their split, and act outside the band (GAP-056)" begin
+    δ = PowerFlows.CONTROL_SHARED_SETPOINT_BAND
+    v0, q0 = _shared_bus_stored()
+    # On setpoint in the stored state: neither moves (before, both went to one common
+    # susceptance, 5 MVAr each).
+    sh, v, _ = _shared_bus_solve(; vset = round(v0; digits = 6))
+    @test all(d.current == d.initial for d in values(sh))
+    # 2δ below the setpoint: they regulate, and end inside the band (on an edge: the
+    # continuation's early, shallow stages carry a band this narrow across it).
+    vset = round(v0 + 2δ; digits = 6)
+    sh, v, _ = _shared_bus_solve(; vset = vset)
+    @test all(d.current > d.initial for d in values(sh))
+    @test vset - δ - 1e-6 <= v <= vset + δ + 1e-6
+    @test min(abs(v - (vset - δ)), abs(v - (vset + δ))) < 1e-6
+end

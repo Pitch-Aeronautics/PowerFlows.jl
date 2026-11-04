@@ -50,6 +50,10 @@ const CONTROL_RAIL_SNAP_REACH = 0.1
 # above this is reported saturated (the homotopy analogue of a PV→PQ Q-limit release). Matches
 # the codebase's "setpoint unreached" threshold used elsewhere in the reactive-control tests.
 const CONTROL_FACTS_SETPOINT_BAND = 1e-3
+# Hold band (p.u., either side of the setpoint) of a continuous switched shunt with a point
+# setpoint (VSWLO = VSWHI) whose regulated bus another device also regulates (GAP-056, see
+# `_share_regulated_setpoints!`): the same "at setpoint" width as FACTS classification.
+const CONTROL_SHARED_SETPOINT_BAND = CONTROL_FACTS_SETPOINT_BAND
 # "At the |b| bound" tolerance for the same classification, RELATIVE to the bound: the final
 # clamped `current` can sit a small fraction below the last-refreshed `b_lim` (the bound is
 # refreshed from the final voltage after the last clamp), so an absolute settle tolerance is
