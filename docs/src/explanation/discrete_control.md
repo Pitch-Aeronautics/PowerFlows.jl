@@ -92,7 +92,8 @@ Two multiperiod-specific behaviors:
 Two abstract families sit under `AbstractControlledDevice`:
 
   - `AbstractBranchControl` — devices that mutate the branch's 2×2 Y-bus block:
-    `ControlledTap` (voltage-controlling `TapTransformer`).
+    `ControlledTap` (voltage-controlling `TapTransformer`) and
+    `ControlledPhaseShifter` (MW-controlling `PhaseShiftingTransformer`, PSS/E COD1 = 3).
   - `AbstractShuntControl` — devices that mutate the bus reactive
     constant-impedance withdrawal: `ControlledSwitchedShunt`
     (voltage-controlling `SwitchedAdmittance`) and `ControlledFACTS`
@@ -426,6 +427,40 @@ carries that flag plus `delivered_q_mvar = b·|V|²·S_base` on the FACTS rows, 
 under active controls the solved `Q` is written back to the component's
 `reactive_power_required` (single time step only; see
 [Multiperiod solves](@ref discrete-control-multiperiod)).
+
+### `PhaseShiftingTransformer` → `ControlledPhaseShifter`
+
+A phase shifter under PSS/E active-power control (COD1 = 3) adjusts its angle in steps to hold
+its MW flow inside a band, and stops at the first step inside (PSS/E's PHSHFT adjustment). It is
+the fourth family: it is indexed after the FACTS devices, goes through the same batched pass,
+band latch, directional snap, band settle and parallel-unit grouping as a tap, and is turned
+off by `phase_shifter_control = false`. PSS/E reuses the voltage fields for COD 3: `VMA1`/`VMI1`
+are the band in MW and `RMA1`/`RMI1` the angle limits in degrees. PowerSystems 5's reader keeps
+them in `ext` only (it never sets `phase_angle_limits`), so `ext` comes first. Each key is read
+from `ext[key]` or `ext["psse"][key]`.
+
+| Parameter     | Source                                                                                                           |
+|:------------- |:---------------------------------------------------------------------------------------------------------------- |
+| Enrolment     | `control_objective == ACTIVE_POWER_FLOW` (the reader sets it from COD1), or `UNDEFINED` with `COD1 = 3`          |
+| Angle limits  | `RMI1`, `RMA1` (degrees); else `phase_angle_limits` (radians) when it is not PowerSystems' default ±π; else lock |
+| MW band       | `VMI1`, `VMA1` (MW, over the system base); required. `VMI1 = VMA1` is a point setpoint                           |
+| Positions     | `NTP1` over `[RMI1, RMA1]`; absent ⇒ 33 (PSS/E's default); below 2 ⇒ continuous                                  |
+| Metered end   | `NMETR = 1` ⇒ winding 2; otherwise winding 1 (PSS/E's default `NMETR = 2`)                                       |
+| Initial angle | `get_α` (radians); outside the limits ⇒ lock                                                                     |
+
+COD1 = −3 is PSS/E's "adjustment suppressed" (`ACTIVE_POWER_FLOW_DISABLED`): the angle is held.
+The regulated quantity is the winding-1 → winding-2 active power at the metered end: at
+winding 1 the power entering the transformer from its `from` bus (magnetizing shunt included,
+as the reported flow), at winding 2 the power leaving it into the `to` bus. Raising α (PNM's
+stamp `t = tap·e^{jα}` on the `from` side) lowers that flow; the direction is taken from the
+measured sensitivity dP/dα, which the polar path computes from the sensitivity context as
+∂P/∂α + ∇ₓP·dx/dα, one triangular solve per device. Parallel units (the same `from` and `to`
+buses) are one control: each measures the group's mean flow and keeps its angle offset, so they
+step together; the band settle never backs one off alone. A `PHASE_SHIFT_ANGLE` impedance
+correction table is re-evaluated at every angle. The solved angle is reported in
+`get_controlled_device_results` (family `"PhaseShiftingTransformer"`), used for the reported
+flows, and written back with `set_α!` by `solve_and_store_power_flow!`. DC power flow keeps the
+stored angle.
 
 ## Reserved seams for future work
 

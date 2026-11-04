@@ -121,6 +121,15 @@ function write_device_settings!(system::PSY.System, data)
         end
         PSY.set_tap!(tx, d.current)
     end
+    for d in set.phase_shifters
+        pst = PSY.get_component(PSY.PhaseShiftingTransformer, system, d.name)
+        if isnothing(pst)
+            @warn "write_device_settings!: PhaseShiftingTransformer \"$(d.name)\" not found \
+                in the system; its solved angle $(d.current) was NOT written back."
+            continue
+        end
+        PSY.set_α!(pst, d.current)
+    end
     for d in set.shunts
         sa = PSY.get_component(PSY.SwitchedAdmittance, system, d.name)
         if isnothing(sa)

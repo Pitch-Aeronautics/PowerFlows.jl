@@ -404,6 +404,12 @@ with the specified solver type.
     a tap with a signed CONT1 in `ext` (`ext["CONT1"]`, or `ext["psse"]["CONT1"]`): positive
     as if the regulated bus were on the winding-2 side (raising the ratio lowers its voltage),
     negative as if on the winding-1 side.
+- `phase_shifter_control::Bool`: With `control_discrete_devices`, adjust the angle of a
+    `PhaseShiftingTransformer` that carries PSS/E active-power control data (COD1 = 3, angle
+    limits RMI1/RMA1 in degrees, MW band VMI1/VMA1; see the discrete-control docs for the field
+    contract) in steps over its NTP1 positions, to hold its MW flow, measured at the metered
+    end, inside the band. A phase shifter without that data, or with COD1 = −3 (PSS/E: control
+    suppressed), keeps its stored angle. `false` holds every phase shifter. Default is `true`.
 - `area_interchange_control::Bool`: Whether to embed PSS/E-style per-area net-interchange
     control in the AC solve (polar formulation; NR/TR/LM/FastDecoupled solvers).
     Default is `false`.
@@ -438,6 +444,7 @@ struct ACPolarPowerFlow{ACSolver <: ACPowerFlowSolverType} <: AbstractACPowerFlo
     tap_voltage_band::Bool
     shunt_voltage_band::Bool
     tap_direction::Symbol
+    phase_shifter_control::Bool
     area_interchange_control::Bool
     interchange_tolerance::Float64
     tie_definition::Symbol
@@ -500,6 +507,7 @@ function ACPolarPowerFlow{ACSolver}(;
     tap_voltage_band::Bool = true,
     shunt_voltage_band::Bool = true,
     tap_direction::Symbol = :sensitivity,
+    phase_shifter_control::Bool = true,
     area_interchange_control::Bool = false,
     interchange_tolerance::Float64 = DEFAULT_INTERCHANGE_TOLERANCE,
     tie_definition::Symbol = :lines_only,
@@ -541,6 +549,7 @@ function ACPolarPowerFlow{ACSolver}(;
         tap_voltage_band,
         shunt_voltage_band,
         tap_direction,
+        phase_shifter_control,
         area_interchange_control,
         validated_interchange_tolerance,
         tie_definition,
@@ -588,6 +597,8 @@ get_shunt_voltage_band(pf::AbstractACPowerFlow) = pf.shunt_voltage_band
 get_shunt_voltage_band(::PowerFlowEvaluationModel) = true
 get_tap_direction(pf::AbstractACPowerFlow) = pf.tap_direction
 get_tap_direction(::PowerFlowEvaluationModel) = :sensitivity
+get_phase_shifter_control(pf::AbstractACPowerFlow) = pf.phase_shifter_control
+get_phase_shifter_control(::PowerFlowEvaluationModel) = true
 
 get_area_interchange_control(pf::AbstractACPowerFlow) = pf.area_interchange_control
 get_area_interchange_control(::PowerFlowEvaluationModel) = false
@@ -643,6 +654,8 @@ polar state layout and have no current-injection equivalent.
     Default `true`.
 - `tap_direction::Symbol`: `:sensitivity` (default) or `:cont_sign` (PSS/E's CONT1 sign
     convention). See [`ACPolarPowerFlow`](@ref).
+- `phase_shifter_control::Bool`: phase-shifter MW control under `control_discrete_devices`.
+    See [`ACPolarPowerFlow`](@ref). Default `true`.
 - `area_interchange_control::Bool`: Not supported on this formulation (area interchange control is polar-only);
     passing `true` throws `ArgumentError`. Default `false`.
 - `solver_settings::Dict{Symbol, Any}`: Default empty.
@@ -668,6 +681,7 @@ struct ACRectangularPowerFlow{ACSolver <: ACPowerFlowSolverType} <:
     tap_voltage_band::Bool
     shunt_voltage_band::Bool
     tap_direction::Symbol
+    phase_shifter_control::Bool
     area_interchange_control::Bool
     interchange_tolerance::Float64
     tie_definition::Symbol
@@ -694,6 +708,7 @@ function ACRectangularPowerFlow{ACSolver}(;
     tap_voltage_band::Bool = true,
     shunt_voltage_band::Bool = true,
     tap_direction::Symbol = :sensitivity,
+    phase_shifter_control::Bool = true,
     area_interchange_control::Bool = false,
     interchange_tolerance::Float64 = DEFAULT_INTERCHANGE_TOLERANCE,
     tie_definition::Symbol = :lines_only,
@@ -741,6 +756,7 @@ function ACRectangularPowerFlow{ACSolver}(;
         tap_voltage_band,
         shunt_voltage_band,
         tap_direction,
+        phase_shifter_control,
         area_interchange_control,
         interchange_tolerance,
         tie_definition,
@@ -798,6 +814,8 @@ polar state layout and have no mixed current-power equivalent.
     Default `true`.
 - `tap_direction::Symbol`: `:sensitivity` (default) or `:cont_sign` (PSS/E's CONT1 sign
     convention). See [`ACPolarPowerFlow`](@ref).
+- `phase_shifter_control::Bool`: phase-shifter MW control under `control_discrete_devices`.
+    See [`ACPolarPowerFlow`](@ref). Default `true`.
 - `area_interchange_control::Bool`: Not supported on this formulation (area interchange control is polar-only);
     passing `true` throws `ArgumentError`. Default `false`.
 - `solver_settings::Dict{Symbol, Any}`: Default empty.
@@ -823,6 +841,7 @@ struct ACMixedPowerFlow{ACSolver <: ACPowerFlowSolverType} <:
     tap_voltage_band::Bool
     shunt_voltage_band::Bool
     tap_direction::Symbol
+    phase_shifter_control::Bool
     area_interchange_control::Bool
     interchange_tolerance::Float64
     tie_definition::Symbol
@@ -849,6 +868,7 @@ function ACMixedPowerFlow{ACSolver}(;
     tap_voltage_band::Bool = true,
     shunt_voltage_band::Bool = true,
     tap_direction::Symbol = :sensitivity,
+    phase_shifter_control::Bool = true,
     area_interchange_control::Bool = false,
     interchange_tolerance::Float64 = DEFAULT_INTERCHANGE_TOLERANCE,
     tie_definition::Symbol = :lines_only,
@@ -894,6 +914,7 @@ function ACMixedPowerFlow{ACSolver}(;
         tap_voltage_band,
         shunt_voltage_band,
         tap_direction,
+        phase_shifter_control,
         area_interchange_control,
         interchange_tolerance,
         tie_definition,

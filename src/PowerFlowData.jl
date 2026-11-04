@@ -654,6 +654,7 @@ function _build_controlled_devices(
         tap_voltage_band = get_tap_voltage_band(pf),
         shunt_voltage_band = get_shunt_voltage_band(pf),
         tap_direction = get_tap_direction(pf),
+        phase_shifter_control = get_phase_shifter_control(pf),
     )
     if isempty(set)
         return nothing

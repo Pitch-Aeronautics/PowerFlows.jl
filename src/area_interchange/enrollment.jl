@@ -173,10 +173,11 @@ _tie_corridor_member(fix::Int, tix::Int, tie::AreaTie) =
 
 # Guard 7a: a voltage-controlling tap incident to a tie endpoint bus, but between a
 # DIFFERENT bus pair than that tie's own corridor.
-function _warn_tap_pollution_hazard(tx, fix::Int, tix::Int, tie::AreaTie)
+function _warn_tap_pollution_hazard(tx, fix::Int, tix::Int, tie::AreaTie;
+    label::String = "ControlledTap")
     _tie_corridor_member(fix, tix, tie) && return
     (_tie_touches(fix, tie) || _tie_touches(tix, tie)) || return
-    @warn "ControlledTap \"$(PSY.get_name(tx))\": incident to the tie between reduced-\
+    @warn "$label \"$(PSY.get_name(tx))\": incident to the tie between reduced-\
         network buses $(tie.from_bus_ix) and $(tie.to_bus_ix) without being a member of \
         its corridor; its tap movement mutates that tie endpoint's Y-bus diagonal, which \
         the cached `diag_pollution` correction cannot track live. Net-interchange \
@@ -221,6 +222,19 @@ function _warn_diag_pollution_hazards(
         (isnothing(fix) || isnothing(tix)) && continue
         for tie in ties
             _warn_tap_pollution_hazard(tx, fix, tix, tie)
+        end
+    end
+    # A flow-controlling phase shifter moves its Y-bus block the same way (GAP-029).
+    for pst in PSY.get_available_components(PSY.PhaseShiftingTransformer, sys)
+        _pst_controls_flow(pst) || continue
+        arc = PSY.get_arc(pst)
+        fix = _resolve_bus_ix(
+            bus_lookup, reverse_bus_search_map, PSY.get_number(PSY.get_from(arc)))
+        tix = _resolve_bus_ix(
+            bus_lookup, reverse_bus_search_map, PSY.get_number(PSY.get_to(arc)))
+        (isnothing(fix) || isnothing(tix)) && continue
+        for tie in ties
+            _warn_tap_pollution_hazard(pst, fix, tix, tie; label = "ControlledPhaseShifter")
         end
     end
     for sa in PSY.get_available_components(PSY.SwitchedAdmittance, sys)

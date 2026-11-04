@@ -125,7 +125,7 @@ end
     end
 end
 _sigmoid_offset(::AbstractControlledDevice) = 0.0
-_sigmoid_offset(d::ControlledTap) = d.offset
+_sigmoid_offset(d::BranchDevice) = d.offset
 
 # Scale-aware settle tolerance: 1e-5 absolute is 5e-5 relative for a 0.2-wide tap band
 # but only 1e-6 relative for a 10 p.u. shunt; a relative floor lets wide-range devices
@@ -362,6 +362,52 @@ function _dF_dp!(
     # so ∂Q_net/∂susc = +Vm² and ∂F[2b]/∂susc = −∂Q_net/∂susc = −Vm² (reactive row only).
     @inbounds rhs[2 * b] = -Vm^2
     return true
+end
+
+# Phase shifter: ∂F/∂α from the angle derivative of its branch block (`_branch_term_slopes`).
+function _dF_dp!(rhs::Vector{Float64}, d::ControlledPhaseShifter, data, ts::Int)
+    fill!(rhs, 0.0)
+    f, t = d.from_ix, d.to_ix
+    Vf = data.bus_magnitude[f, ts] * cis(data.bus_angles[f, ts])
+    Vt = data.bus_magnitude[t, ts] * cis(data.bus_angles[t, ts])
+    dYff, dYft, dYtf, dYtt = _branch_term_slopes(d, d.current)
+    dSf = Vf * conj(dYff * Vf + dYft * Vt)
+    dSt = Vt * conj(dYtf * Vf + dYtt * Vt)
+    @inbounds begin
+        rhs[2 * f - 1] = real(dSf)
+        rhs[2 * f] = imag(dSf)
+        rhs[2 * t - 1] = real(dSt)
+        rhs[2 * t] = imag(dSt)
+    end
+    return true
+end
+
+# dx_b/dp entries of the state a branch flow depends on: |V_b| is a state only at a PQ bus and
+# θ_b at a PQ or PV bus (x[2b−1], x[2b]; see `update_state!`); elsewhere it is held, so 0.
+@inline function _state_slope(data, ts::Int, sol::Vector{Float64}, b::Int)
+    bt = data.bus_type[b, ts]
+    dv = bt == PSY.ACBusTypes.PQ ? -sol[2 * b - 1] : 0.0
+    dθ = bt == PSY.ACBusTypes.REF ? 0.0 : -sol[2 * b]
+    return dv, dθ
+end
+
+# Linearized dP/dα of a phase shifter's regulated flow (its own, or its parallel group's mean):
+# dP/dα = ∂P/∂α + ∇ₓP·dx/dα with dx/dα = −J⁻¹·∂F/∂α, one triangular solve on the sensitivity
+# context's factorization; the partials come from each unit's terminal flow.
+function _linear_plant_sign(d::ControlledPhaseShifter, data, ts::Int,
+    ctx::_SensitivityContext)
+    _dF_dp!(ctx.rhs, d, data, ts)
+    copyto!(ctx.sol, ctx.rhs)
+    solve!(ctx.lin_cache, ctx.sol)
+    members = isempty(d.group) ? (d,) : d.group
+    g = 0.0
+    for m in members
+        _, dvf, dvt, dθf, dθt, dα = _metered_flow_partials(m, data, ts)
+        xvf, xθf = _state_slope(data, ts, ctx.sol, m.from_ix)
+        xvt, xθt = _state_slope(data, ts, ctx.sol, m.to_ix)
+        g += dvf * xvf + dvt * xvt + dθf * xθf + dθt * xθt + (m === d ? dα : 0.0)
+    end
+    return g / length(members), true
 end
 
 # Linearized dy/dp for a voltage device via the factored Jacobian. `y = Vm(controlled_bus)`
@@ -679,14 +725,22 @@ end
 # steps, the other none). Each unit's `offset` is its ratio less the mean of the units that share
 # its arc orientation, and its sigmoid window is shifted by it (`_control_target`), so the units
 # move by the same amount, as PSS/E steps parallel units together.
-function _align_parallel_taps!(taps::Vector{ControlledTap}, dVdp::Vector{Float64},
-    frozen::Vector{Bool})
+#
+# Parallel phase shifters (the same from and to buses, in the same orientation) are grouped the
+# same way, and each member measures the group's mean flow (`group`), so the units regulate one
+# quantity and move together.
+_parallel_key(d::ControlledTap) = (d.controlled_ix, minmax(d.from_ix, d.to_ix)...)
+_parallel_key(d::ControlledPhaseShifter) = (0, d.from_ix, d.to_ix)
+_set_group!(::ControlledTap, members) = nothing
+_set_group!(d::ControlledPhaseShifter, members) = (d.group = members; nothing)
+
+function _align_parallel_taps!(taps::Vector{<:BranchDevice}, dVdp::Vector{Float64},
+    frozen::Vector{Bool}, offset::Int = 0)
     length(taps) < 2 && return
     groups = Dict{NTuple{3, Int}, Vector{Int}}()
     for (i, d) in enumerate(taps)
-        frozen[i] && continue
-        key = (d.controlled_ix, minmax(d.from_ix, d.to_ix)...)
-        push!(get!(groups, key, Int[]), i)
+        frozen[offset + i] && continue
+        push!(get!(groups, _parallel_key(d), Int[]), i)
     end
     for members in values(groups)
         length(members) < 2 && continue
@@ -699,19 +753,23 @@ function _align_parallel_taps!(taps::Vector{ControlledTap}, dVdp::Vector{Float64
                 taps[i].offset = taps[i].current - m
             end
         end
-        signs = [sign(dVdp[i]) * orient(i) for i in members]
+        unit_group = taps[members]
+        for i in members
+            _set_group!(taps[i], unit_group)
+        end
+        signs = [sign(dVdp[offset + i]) * orient(i) for i in members]
         all(==(signs[1]), signs) && continue
-        total = sum(dVdp[i] * orient(i) for i in members)
+        total = sum(dVdp[offset + i] * orient(i) for i in members)
         iszero(total) && continue
         for i in members
             d = taps[i]
             iszero(d.orientation) || continue
             d.aligned = Int(sign(total)) * orient(i)
-            dVdp[i] = d.aligned * abs(dVdp[i])
+            dVdp[offset + i] = d.aligned * abs(dVdp[offset + i])
         end
         names = join((taps[i].name for i in members), ", ")
-        @debug "discrete control: parallel taps $names measured opposite dV/dtap signs; \
-            aligned to their joint effect."
+        @debug "discrete control: parallel units $names measured opposite sensitivity \
+            signs; aligned to their joint effect."
     end
     return
 end
@@ -749,16 +807,27 @@ function _apply_targets_group!(
     dVdp::Vector{Float64}, osc::Vector{Int}, prev_sign::Vector{Int}, n_shared::Vector{Int},
     p_prev::Vector{Float64}, did_move::Vector{Bool},
 )
+    # Every target is taken before any is applied: a phase shifter's measured flow depends on
+    # its own angle and its parallel units' (`measured_value`), which an earlier member's apply
+    # would change on the unsolved state. (A voltage device's measurement is its bus voltage,
+    # which an apply does not touch, so for those the two orders agree.)
     any_moved = false
+    targets = Vector{Float64}(undef, length(devices))
     for (i, d) in enumerate(devices)
         idx = offset + i
+        targets[i] = NaN
         frozen[idx] && continue
         p_now = current_parameter(d)
         p_new, _, ok =
             _damped_target!(d, idx, data, ts, S, frozen, dVdp, osc, prev_sign, n_shared)
         (ok && abs(p_new - p_now) >= _param_tol(d)) || continue
-        p_prev[idx] = p_now
-        apply_parameter!(d, data, p_new, ts)
+        targets[i] = p_new
+    end
+    for (i, d) in enumerate(devices)
+        isnan(targets[i]) && continue
+        idx = offset + i
+        p_prev[idx] = current_parameter(d)
+        apply_parameter!(d, data, targets[i], ts)
         did_move[idx] = true
         any_moved = true
     end
@@ -817,7 +886,10 @@ function _batched_pass!(
     anchor0 = Float64[d.anchor for d in set.taps]
     shunt_side0 = Int[d.side for d in set.shunts]
     shunt_anchor0 = Float64[d.anchor for d in set.shunts]
+    pst_side0 = Int[d.side for d in set.phase_shifters]
+    pst_anchor0 = Float64[d.anchor for d in set.phase_shifters]
     off_facts = n_taps + n_shunts
+    off_pst = off_facts + length(set.facts)
     moved = _apply_targets_group!(set.taps, 0, data, ts, S, frozen, dVdp, osc, prev_sign,
         n_shared, p_prev, did_move)
     moved |= _apply_targets_group!(set.shunts, n_taps, data, ts, S, frozen, dVdp, osc,
@@ -827,16 +899,21 @@ function _batched_pass!(
     _refresh_facts_limits!(set.facts, off_facts, data, ts, frozen)
     moved |= _apply_targets_group!(set.facts, off_facts, data, ts, S, frozen, dVdp, osc,
         prev_sign, n_shared, p_prev, did_move)
+    moved |= _apply_targets_group!(set.phase_shifters, off_pst, data, ts, S, frozen, dVdp,
+        osc, prev_sign, n_shared, p_prev, did_move)
     moved || return true, true            # nothing wanted to move ⇒ settled, no solve needed
     if _ctrl_solve!(pf, data, ts; kwargs...) && _refresh_sensitivity_context!(ctx, data, ts; kwargs...)
         _refresh_gains_group!(set.taps, 0, data, ts, frozen, dVdp, did_move, ctx)
         _refresh_gains_group!(set.shunts, n_taps, data, ts, frozen, dVdp, did_move, ctx)
         _refresh_gains_group!(set.facts, off_facts, data, ts, frozen, dVdp, did_move, ctx)
+        _refresh_gains_group!(set.phase_shifters, off_pst, data, ts, frozen, dVdp, did_move,
+            ctx)
         return false, true                # moved + converged ⇒ not settled
     end
     _rollback_targets_group!(set.taps, 0, data, ts, p_prev, did_move)
     _rollback_targets_group!(set.shunts, n_taps, data, ts, p_prev, did_move)
     _rollback_targets_group!(set.facts, off_facts, data, ts, p_prev, did_move)
+    _rollback_targets_group!(set.phase_shifters, off_pst, data, ts, p_prev, did_move)
     _restore_state!(data, ts, snap)
     copyto!(osc, osc0)
     copyto!(prev_sign, prev0)
@@ -848,6 +925,10 @@ function _batched_pass!(
     for (i, d) in enumerate(set.shunts)
         d.side = shunt_side0[i]
         d.anchor = shunt_anchor0[i]
+    end
+    for (i, d) in enumerate(set.phase_shifters)
+        d.side = pst_side0[i]
+        d.anchor = pst_anchor0[i]
     end
     return false, false          # joint solve or sensitivity refresh failed ⇒ run sequential path
 end
@@ -884,6 +965,8 @@ function _step_voltage_groups!(
     _refresh_facts_limits!(set.facts, n_taps + n_shunts, data, ts, frozen)
     settled &= _step_device_group!(set.facts, n_taps + n_shunts, data, ts, S, pf,
         scratch_snap, frozen, dVdp, osc, prev_sign, n_shared; kwargs...)
+    settled &= _step_device_group!(set.phase_shifters, n_taps + n_shunts + length(set.facts),
+        data, ts, S, pf, scratch_snap, frozen, dVdp, osc, prev_sign, n_shared; kwargs...)
     return settled
 end
 
@@ -935,11 +1018,20 @@ function _control_continuation!(
         d.side = 0
         d.anchor = d.current
     end
+    for d in set.phase_shifters
+        d.side = 0
+        d.anchor = d.current
+        d.aligned = 0
+        d.offset = 0.0
+        d.group = ControlledPhaseShifter[]
+    end
 
     n_taps = length(set.taps)
     n_shunts = length(set.shunts)
     n_facts = length(set.facts)
-    n_dev = n_taps + n_shunts + n_facts
+    n_psts = length(set.phase_shifters)
+    off_pst = n_taps + n_shunts + n_facts
+    n_dev = off_pst + n_psts
     # Per-device state, indexed in parallel with [taps; shunts; facts]. dVdp: sign
     # sets the negative-feedback orientation, magnitude drives ω; frozen devices are held, not stepped.
     dVdp = zeros(n_dev)
@@ -955,6 +1047,16 @@ function _control_continuation!(
     _fill_shared!(n_shared, 0, counts, set.taps)
     _fill_shared!(n_shared, n_taps, counts, set.shunts)
     _fill_shared!(n_shared, n_taps + n_shunts, counts, set.facts)
+    # Phase shifters regulate branch flows, not bus voltages: parallel units (one group, see
+    # `_align_parallel_taps!`) split the correction among themselves.
+    pst_counts = Dict{NTuple{3, Int}, Int}()
+    for d in set.phase_shifters
+        k = _parallel_key(d)
+        pst_counts[k] = get(pst_counts, k, 0) + 1
+    end
+    for (i, d) in enumerate(set.phase_shifters)
+        n_shared[off_pst + i] = pst_counts[_parallel_key(d)]
+    end
 
     # One buffer shared by the probe phase, the pass loop, and the post-loop per-device
     # restore: those phases run in sequence and are never simultaneously live. The exception
@@ -983,6 +1085,13 @@ function _control_continuation!(
     _probe_device_signs!(
         set.facts, n_taps + n_shunts, dVdp, frozen, ctx, data, ts, pf, scratch_snap;
         kwargs...)
+    # Group parallel phase shifters first, so each probe measures the group's mean flow; then
+    # align any opposite signs.
+    _align_parallel_taps!(set.phase_shifters, dVdp, frozen, off_pst)
+    _probe_device_signs!(
+        set.phase_shifters, off_pst, dVdp, frozen, ctx, data, ts, pf, scratch_snap;
+        kwargs...)
+    _align_parallel_taps!(set.phase_shifters, dVdp, frozen, off_pst)
     if any(frozen)
         frozen_names = join(
             vcat(
@@ -993,6 +1102,7 @@ function _control_continuation!(
                     set.facts[k].name
                     for k in eachindex(set.facts) if frozen[n_taps + n_shunts + k]
                 ],
+                [set.phase_shifters[k].name for k in 1:n_psts if frozen[off_pst + k]],
             ),
             ", ",
         )
@@ -1274,18 +1384,20 @@ function _band_settle!(
     pf, data, set::ControlledDeviceSet, ts::Int, snap::ControlStateSnapshot,
     dVdp::Union{Nothing, Vector{Float64}} = nothing; kwargs...,
 )
-    (any(_band_latched, set.taps) || any(_band_latched, set.shunts)) || return
-    n_taps = length(set.taps)
-    n = n_taps + length(set.shunts)
+    (any(_band_latched, set.taps) || any(_band_latched, set.shunts) ||
+     any(_band_latched, set.phase_shifters)) || return
+    n = length(set.taps) + length(set.shunts) + length(set.phase_shifters)
     prev = zeros(n)
     moved = fill(false, n)
     rounds = max(
         maximum(d -> length(d.levels), set.taps; init = 0),
         maximum(d -> length(d.levels), set.shunts; init = 0),
+        maximum(d -> length(d.levels), set.phase_shifters; init = 0),
     )
     _band_forward!(pf, data, set, ts, snap, prev, moved, rounds; kwargs...) || return
     positions() = vcat(Float64[d.current for d in set.taps],
-        Float64[d.current for d in set.shunts])
+        Float64[d.current for d in set.shunts],
+        Float64[d.current for d in set.phase_shifters])
     for _ in 1:CONTROL_BAND_SETTLE_SWEEPS
         before = positions()
         _band_back_off!(pf, data, set, ts, snap, prev, moved, rounds, dVdp; kwargs...) ||
@@ -1297,6 +1409,7 @@ function _band_settle!(
 end
 
 _band_latched(d::ControlledTap) = d.band && d.side != 0
+_band_latched(d::ControlledPhaseShifter) = d.band && d.side != 0 && !isempty(d.levels)
 _band_latched(d::ControlledSwitchedShunt) = d.band && d.side != 0 && !d.continuous
 _band_direction(d::BandedDevice) = Int(sign(d.current - d.anchor))
 
@@ -1314,9 +1427,15 @@ function _band_undo_group!(devices, offset::Int, data, ts::Int, prev, moved)
     return
 end
 
+# The band settle indexes its own scratch [taps; shunts; phase shifters]; the continuation's gains
+# `dVdp` are indexed [taps; shunts; facts; phase shifters].
+_settle_pst_offset(set) = length(set.taps) + length(set.shunts)
+_gain_pst_offset(set) = length(set.taps) + length(set.shunts) + length(set.facts)
+
 function _band_round_failed!(data, set, ts, snap, prev, moved)
     _band_undo_group!(set.taps, 0, data, ts, prev, moved)
     _band_undo_group!(set.shunts, length(set.taps), data, ts, prev, moved)
+    _band_undo_group!(set.phase_shifters, _settle_pst_offset(set), data, ts, prev, moved)
     _restore_state!(data, ts, snap)
     @warn "discrete control: a banded device's step toward the first position inside its \
         voltage band did not converge; leaving the devices at their last converged \
@@ -1326,9 +1445,11 @@ end
 
 # One forward step of every latched device of a group still outside its band.
 function _band_forward_group!(devices, offset::Int, data, ts::Int, prev, moved)
+    # Measured before any step is applied (see `_apply_targets_group!`).
+    outside = [_band_latched(d) && _outside_latched_side(d, measured_value(d, data, ts))
+               for d in devices]
     for (i, d) in enumerate(devices)
-        _band_latched(d) || continue
-        _outside_latched_side(d, measured_value(d, data, ts)) || continue
+        outside[i] || continue
         dir = _band_direction(d)
         iszero(dir) && continue
         nxt = _next_level(d, dir)
@@ -1346,6 +1467,8 @@ function _band_forward!(pf, data, set, ts, snap, prev, moved, rounds; kwargs...)
         _capture_state!(snap, data, ts)
         _band_forward_group!(set.taps, 0, data, ts, prev, moved)
         _band_forward_group!(set.shunts, length(set.taps), data, ts, prev, moved)
+        _band_forward_group!(set.phase_shifters, _settle_pst_offset(set), data, ts, prev,
+            moved)
         any(moved) || return true
         _ctrl_solve!(pf, data, ts; kwargs...) ||
             return _band_round_failed!(data, set, ts, snap, prev, moved)
@@ -1381,10 +1504,12 @@ end
 function _band_revert_group!(devices, offset::Int, data, ts::Int, prev, moved, active,
     retry, solo::Bool)
     reverted = false
+    # Measured before any device is returned (see `_apply_targets_group!`).
+    outside = [moved[offset + i] && _outside_latched_side(d, measured_value(d, data, ts))
+               for (i, d) in enumerate(devices)]
     for (i, d) in enumerate(devices)
         idx = offset + i
-        moved[idx] || continue
-        _outside_latched_side(d, measured_value(d, data, ts)) || continue
+        outside[i] || continue
         _band_apply!(d, data, prev[idx], ts)
         active[idx] = false
         retry[idx] = !solo
@@ -1400,7 +1525,7 @@ end
 # such level stays outside its band whatever the others do; PSS/E accepts it there.
 _can_correct(d::ControlledSwitchedShunt, ::Union{Nothing, Float64}) =
     !isnothing(_next_level(d, -d.side))
-function _can_correct(d::ControlledTap, g::Union{Nothing, Float64})
+function _can_correct(d::BranchDevice, g::Union{Nothing, Float64})
     (isnothing(g) || iszero(g)) && return true
     return !isnothing(_next_level(d, -d.side * Int(sign(g))))
 end
@@ -1423,8 +1548,17 @@ function _any_latched_outside(set::ControlledDeviceSet, data, ts::Int, dVdp = no
     for (i, d) in enumerate(set.shunts)
         _correctable_outside(d, data, ts, _settle_gain(dVdp, n_taps + i)) && return true
     end
+    off = _gain_pst_offset(set)
+    for (i, d) in enumerate(set.phase_shifters)
+        _correctable_outside(d, data, ts, _settle_gain(dVdp, off + i)) && return true
+    end
     return false
 end
+
+# A unit of a parallel phase-shifter group regulates the group's mean flow and steps only with
+# the group (the joint rounds), never alone: alone it would split the units by a step.
+_solo_steps(::AbstractControlledDevice) = true
+_solo_steps(d::ControlledPhaseShifter) = isempty(d.group)
 
 # Solo back-off of one group's devices marked for a retry: each steps back alone, with one
 # solve, and keeps the step while every latched device stays inside its band; otherwise it
@@ -1436,6 +1570,10 @@ function _band_solo_group!(pf, data, set, devices, offset::Int, ts::Int, snap, r
     for (i, d) in enumerate(devices)
         idx = offset + i
         retry[idx] || continue
+        if !_solo_steps(d)
+            retry[idx] = false
+            continue
+        end
         dir = _band_direction(d)
         back = _next_level(d, -dir)
         lo, hi = parameter_limits(d)
@@ -1468,15 +1606,22 @@ function _unmoved_pushed_out(set::ControlledDeviceSet, data, ts::Int, moved, dVd
         moved[n_taps + i] && continue
         _correctable_outside(d, data, ts, _settle_gain(dVdp, n_taps + i)) && return true
     end
+    off, goff = _settle_pst_offset(set), _gain_pst_offset(set)
+    for (i, d) in enumerate(set.phase_shifters)
+        moved[off + i] && continue
+        _correctable_outside(d, data, ts, _settle_gain(dVdp, goff + i)) && return true
+    end
     return false
 end
 
 function _band_back_off!(pf, data, set, ts, snap, prev, moved, rounds, dVdp = nothing;
     kwargs...)
     n_taps = length(set.taps)
+    off_p = _settle_pst_offset(set)
     active = vcat(
         [_band_latched(d) && !iszero(_band_direction(d)) for d in set.taps],
         [_band_latched(d) && !iszero(_band_direction(d)) for d in set.shunts],
+        [_band_latched(d) && !iszero(_band_direction(d)) for d in set.phase_shifters],
     )
     retry = fill(false, length(active))
     for _ in 1:rounds
@@ -1484,6 +1629,7 @@ function _band_back_off!(pf, data, set, ts, snap, prev, moved, rounds, dVdp = no
         _capture_state!(snap, data, ts)
         _band_back_group!(set.taps, 0, data, ts, prev, moved, active)
         _band_back_group!(set.shunts, n_taps, data, ts, prev, moved, active)
+        _band_back_group!(set.phase_shifters, off_p, data, ts, prev, moved, active)
         any(moved) || break
         _ctrl_solve!(pf, data, ts; kwargs...) ||
             return _band_round_failed!(data, set, ts, snap, prev, moved)
@@ -1492,6 +1638,7 @@ function _band_back_off!(pf, data, set, ts, snap, prev, moved, rounds, dVdp = no
             # (the captured state is exact) and leave its devices to the solo retries.
             _band_undo_group!(set.taps, 0, data, ts, prev, moved)
             _band_undo_group!(set.shunts, n_taps, data, ts, prev, moved)
+            _band_undo_group!(set.phase_shifters, off_p, data, ts, prev, moved)
             _restore_state!(data, ts, snap)
             for i in eachindex(moved)
                 moved[i] || continue
@@ -1505,6 +1652,8 @@ function _band_back_off!(pf, data, set, ts, snap, prev, moved, rounds, dVdp = no
             solo)
         reverted |= _band_revert_group!(set.shunts, n_taps, data, ts, prev, moved, active,
             retry, solo)
+        reverted |= _band_revert_group!(set.phase_shifters, off_p, data, ts, prev, moved,
+            active, retry, solo)
         if reverted && !_ctrl_solve!(pf, data, ts; kwargs...)
             return _band_round_failed!(data, set, ts, snap, prev, moved)
         end
@@ -1517,6 +1666,8 @@ function _band_back_off!(pf, data, set, ts, snap, prev, moved, rounds, dVdp = no
             kwargs...)
         stepped |= _band_solo_group!(pf, data, set, set.shunts, n_taps, ts, snap, retry,
             dVdp; kwargs...)
+        stepped |= _band_solo_group!(pf, data, set, set.phase_shifters, off_p, ts, snap,
+            retry, dVdp; kwargs...)
         stepped || break
     end
     return true
@@ -1539,6 +1690,7 @@ function snap_and_restore!(
     cont_taps = _snap_device_group!(set.taps, data, ts)
     cont_shunts = _snap_device_group!(set.shunts, data, ts)
     cont_facts = _snap_device_group!(set.facts, data, ts)
+    cont_psts = _snap_device_group!(set.phase_shifters, data, ts)
     if _ctrl_solve!(pf, data, ts; kwargs...)
         _band_settle!(pf, data, set, ts, scratch_snap, dVdp; kwargs...)
         return true
@@ -1549,12 +1701,15 @@ function snap_and_restore!(
         set.shunts, data, ts, cont_shunts, pf, scratch_snap; kwargs...)
     ok &= _restore_device_group!(
         set.facts, data, ts, cont_facts, pf, scratch_snap; kwargs...)
+    ok &= _restore_device_group!(
+        set.phase_shifters, data, ts, cont_psts, pf, scratch_snap; kwargs...)
     if !ok
         names = join(
             vcat(
                 [d.name for d in set.taps],
                 [d.name for d in set.shunts],
                 [d.name for d in set.facts],
+                [d.name for d in set.phase_shifters],
             ),
             ", ",
         )
@@ -1597,6 +1752,7 @@ function get_controlled_device_results(data)
                 ("TapTransformer", set.taps),
                 ("SwitchedAdmittance", set.shunts),
                 ("FACTSControlDevice", set.facts),
+                ("PhaseShiftingTransformer", set.phase_shifters),
             )
                 for (i, d) in enumerate(devices)
                     lo, hi = stored_parameter_limits(set, d, i, ts)

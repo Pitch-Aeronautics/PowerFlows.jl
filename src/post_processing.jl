@@ -504,6 +504,25 @@ function _flow_branch_entries(
     return PNM.ybus_branch_entries(segment, get_network_reduction_data(data))
 end
 
+# A phase shifter that discrete control enrolled (COD1 = 3): its block at the angle the solve
+# ended on for `time_step`, with its correction table re-evaluated there.
+function _flow_branch_entries(
+    segment::PSY.PhaseShiftingTransformer,
+    data::ACPowerFlowData,
+    time_step::Int,
+)
+    set = get_controlled_devices(data)
+    if !isnothing(set)
+        i = get(set.pst_index, PSY.get_name(segment), 0)
+        if !iszero(i)
+            d = set.phase_shifters[i]
+            (ff, ft, tf, tt) = _branch_terms(d, set.pst_current[i, time_step])
+            return (ff + PSY.get_primary_shunt(segment), ft, tf, tt)
+        end
+    end
+    return PNM.ybus_branch_entries(segment, get_network_reduction_data(data))
+end
+
 """
     _segment_flow_entry(segment, V_from, V_to, entries)
 

@@ -98,12 +98,12 @@ end
 # `PSY.ImpedanceCorrectionData` on each `TapTransformer`, keyed by component UUID. One pass
 # over the attribute pairs, as PNM's `build_impedance_correction_factors!` does: a per-tap
 # supplemental-attribute query hits the association store and is too slow for large cases.
-function _tap_correction_tables(sys)
+function _tap_correction_tables(sys, ::Type{T} = PSY.TapTransformer) where {T}
     tables = Dict{Base.UUID, PSY.ImpedanceCorrectionData}()
     isempty(PSY.get_supplemental_attributes(PSY.ImpedanceCorrectionData, sys)) &&
         return tables
     for pair in PSY.get_component_supplemental_attribute_pairs(
-        PSY.TapTransformer,
+        T,
         PSY.ImpedanceCorrectionData,
         sys,
     )
@@ -285,7 +285,12 @@ once inside, snap to the nearest step of the input-order chains.
 parallel taps regulating one bus aligned when they measure opposite signs (see
 `_align_parallel_taps!`). `:cont_sign` orients a tap with a CONT1 in `ext` as PSS/E does instead
 (a terminal bus on its own winding's side, a remote bus by CONT1's sign; see
-`_tap_cont_orientation`); taps without one stay on the measured sign."""
+`_tap_cont_orientation`); taps without one stay on the measured sign.
+
+`phase_shifter_control = true` (the default) enrols each `PhaseShiftingTransformer` under PSS/E
+active-power control (COD1 = 3) with complete control data (`_pst_metadata`): its angle steps
+over its positions to hold its metered MW flow inside `[VMI1, VMA1]`. `false` holds every phase
+shifter at its stored angle."""
 function build_controlled_device_set(
     sys,
     bus_lookup::Dict{Int, Int},
@@ -295,6 +300,7 @@ function build_controlled_device_set(
     tap_voltage_band::Bool = true,
     shunt_voltage_band::Bool = true,
     tap_direction::Symbol = :sensitivity,
+    phase_shifter_control::Bool = true,
 )
     _validate_tap_direction(tap_direction)
     taps = ControlledTap[]
@@ -456,7 +462,142 @@ function build_controlled_device_set(
     _share_regulated_setpoints!(shunts, taps, facts, sys, bus_lookup,
         reverse_bus_search_map; band = shunt_voltage_band)
 
-    return ControlledDeviceSet(taps, shunts, facts, n_time_steps)
+    phase_shifters = ControlledPhaseShifter[]
+    phase_shifter_control && _enroll_phase_shifters!(
+        phase_shifters, sys, bus_lookup, reverse_bus_search_map, ybus)
+
+    return ControlledDeviceSet(taps, shunts, facts, n_time_steps;
+        phase_shifters = phase_shifters)
+end
+
+"""A PSS/E control field of a component: `ext[key]`, or `ext["psse"][key]` (our ingest's
+spelling), when it is a number; `nothing` otherwise."""
+function _psse_field(c, key::String)
+    ext = PSY.get_ext(c)
+    v = get(ext, key, nothing)
+    v isa Real && return v
+    psse = get(ext, "psse", nothing)
+    v = psse isa AbstractDict ? get(psse, key, nothing) : nothing
+    return v isa Real ? v : nothing
+end
+
+"""Whether a `PhaseShiftingTransformer` is under PSS/E active-power control (COD1 = +3):
+`control_objective == ACTIVE_POWER_FLOW` (the PSS/E reader sets it from COD1), or, when the
+objective is `UNDEFINED`, a COD1 of 3 in `ext`. COD1 = −3 (`ACTIVE_POWER_FLOW_DISABLED`) is
+PSS/E's "adjustment suppressed" and keeps the stored angle."""
+function _pst_controls_flow(pst)
+    obj = PSY.get_control_objective(pst)
+    obj == PSY.TransformerControlObjective.ACTIVE_POWER_FLOW && return true
+    obj == PSY.TransformerControlObjective.UNDEFINED || return false
+    cod = _psse_field(pst, "COD1")
+    return !isnothing(cod) && Int(cod) == 3
+end
+
+# PowerSystems' default `phase_angle_limits` (±3.1416), which its PSS/E reader never overrides.
+_is_default_angle_limits(lims) = lims.min <= -3.14 && lims.max >= 3.14
+
+"""Phase-shifter control metadata, or `nothing` (with a `@warn`) when it is incomplete:
+angle limits in radians (`RMI1`/`RMA1`, degrees, from `ext`; else `phase_angle_limits` when it
+is not PowerSystems' default ±π), the MW band (`VMI1`/`VMA1`, required), the number of
+positions (`NTP1`, PSS/E's default 33 when absent; below 2 a continuous shifter) and the metered
+end (`NMETR` = 1 meters winding 2; otherwise winding 1, PSS/E's default)."""
+function _pst_metadata(pst)
+    name = PSY.get_name(pst)
+    rmi, rma = _psse_field(pst, "RMI1"), _psse_field(pst, "RMA1")
+    if !isnothing(rmi) && !isnothing(rma)
+        amin, amax = deg2rad(Float64(rmi)), deg2rad(Float64(rma))
+    else
+        lims = PSY.get_phase_angle_limits(pst)
+        if _is_default_angle_limits(lims)
+            @warn "ControlledPhaseShifter \"$name\": COD1 = 3 but no angle limits \
+                (RMI1/RMA1 in ext, or phase_angle_limits narrower than ±π); leaving the \
+                angle locked."
+            return nothing
+        end
+        amin, amax = Float64(lims.min), Float64(lims.max)
+    end
+    vmi, vma = _psse_field(pst, "VMI1"), _psse_field(pst, "VMA1")
+    if isnothing(vmi) || isnothing(vma)
+        @warn "ControlledPhaseShifter \"$name\": COD1 = 3 but no MW band (VMI1/VMA1 in \
+            ext); leaving the angle locked."
+        return nothing
+    end
+    ntp = _psse_field(pst, "NTP1")
+    ntp = isnothing(ntp) ? 33 : Int(ntp)
+    nmetr = _psse_field(pst, "NMETR")
+    metered = (!isnothing(nmetr) && Int(nmetr) == 1) ? 2 : 1
+    return (amin = amin, amax = amax, vmi = Float64(vmi), vma = Float64(vma), ntp = ntp,
+        metered = metered)
+end
+
+function _pst_series_admittance(pst, correction_tables)
+    yt = 1.0 / (PSY.get_r(pst) + PSY.get_x(pst) * im)
+    ict = get(correction_tables, IS.get_uuid(pst), nothing)
+    isnothing(ict) && return yt, nothing
+    if PSY.get_transformer_control_mode(ict) ==
+       PSY.ImpedanceCorrectionTransformerControlMode.PHASE_SHIFT_ANGLE
+        return yt, PSY.get_impedance_correction_curve(ict)
+    end
+    return yt / PNM._evaluate_correction_table(pst, ict), nothing
+end
+
+"""Enrol every available `PhaseShiftingTransformer` under PSS/E active-power control (GAP-029;
+see `ControlledPhaseShifter` and `_pst_metadata` for the fields read). Bad or missing control
+data leaves the shifter at its stored angle with a `@warn`."""
+function _enroll_phase_shifters!(psts::Vector{ControlledPhaseShifter}, sys, bus_lookup,
+    reverse_bus_search_map, ybus)
+    base_mva = PSY.get_base_power(sys)
+    correction_tables = _tap_correction_tables(sys, PSY.PhaseShiftingTransformer)
+    for pst in PSY.get_available_components(PSY.PhaseShiftingTransformer, sys)
+        _pst_controls_flow(pst) || continue
+        name = PSY.get_name(pst)
+        arc = PSY.get_arc(pst)
+        fb = PSY.get_number(PSY.get_from(arc))
+        tb = PSY.get_number(PSY.get_to(arc))
+        fix = _resolve_bus_ix(bus_lookup, reverse_bus_search_map, fb)
+        tix = _resolve_bus_ix(bus_lookup, reverse_bus_search_map, tb)
+        if isnothing(fix) || isnothing(tix) || fix == tix
+            @warn "ControlledPhaseShifter \"$name\": a terminal bus is not in the (reduced) \
+                network, or the arc collapsed; leaving the angle locked."
+            continue
+        end
+        md = _pst_metadata(pst)
+        isnothing(md) && continue
+        if !(md.amin < md.amax)
+            @warn "ControlledPhaseShifter \"$name\": angle limits [$(md.amin), $(md.amax)] \
+                rad leave no range; leaving the angle locked."
+            continue
+        end
+        if md.vmi > md.vma
+            @warn "ControlledPhaseShifter \"$name\": VMI1 = $(md.vmi) MW exceeds VMA1 = \
+                $(md.vma) MW; leaving the angle locked."
+            continue
+        end
+        α0 = PSY.get_α(pst)
+        if !(md.amin - BOUNDS_TOLERANCE <= α0 <= md.amax + BOUNDS_TOLERANCE)
+            @warn "ControlledPhaseShifter \"$name\": initial angle $α0 rad lies outside \
+                [$(md.amin), $(md.amax)]; leaving the angle locked."
+            continue
+        end
+        yt, correction = _pst_series_admittance(pst, correction_tables)
+        lo, hi = md.vmi / base_mva, md.vma / base_mva
+        levels = md.ntp >= 2 ? collect(range(md.amin, md.amax; length = md.ntp)) : Float64[]
+        push!(
+            psts,
+            ControlledPhaseShifter(
+                name, fix, tix, md.metered, PSY.get_tap(pst), yt,
+                PSY.get_primary_shunt(pst), (lo + hi) / 2, md.amin, md.amax, levels,
+                _ybus_block_offsets(ybus, fix, tix),
+                α0, α0, α0,           # initial, synced, current
+                correction,
+                lo < hi, lo, hi,
+                0, α0,                # side, anchor (continuation scratch)
+                0, 0, 0.0,            # orientation (measured), aligned, offset
+                ControlledPhaseShifter[],
+            ),
+        )
+    end
+    return
 end
 
 """The bus a generator regulates remotely, by PSS/E's IREG, or `nothing`. PowerSystems has no

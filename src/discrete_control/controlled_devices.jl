@@ -73,11 +73,60 @@ ControlledTap(
     initial, synced, current, correction, band, v_lo, v_hi, side, anchor, 0, 0, 0.0,
 )
 
+"""Active-power-controlling phase shifter (PSS/E COD1 = 3, GAP-029): a `PhaseShiftingTransformer`
+whose angle `α` (the parameter, radians) steps over `levels` (NTP1 positions over
+[RMI1, RMA1]; empty for a continuous shifter) to hold its active power flow inside the band
+`[v_lo, v_hi]` (VMI1/VMA1 in MW over the system base, so p.u.). The flow is the winding-1 →
+winding-2 active power measured at the metered end (`metered` 1, the default, or 2 from PSS/E's
+NMETR): at winding 1 the power entering the transformer from the `from` bus, at winding 2 the
+power leaving it into the `to` bus. The ratio `tap` is fixed. Its Y-bus block and arc rows are
+delta-updated as a tap's are, with `t = tap·e^{jα}` varying in angle (see `_branch_terms`).
+
+The band, latch, directional snap, settle and parallel-unit alignment are the tap family's
+(`BandedDevice`, `_align_parallel_taps!`). The orientation always comes from the measured
+dP/dα (`orientation` is 0). A unit of a parallel group (same terminals) measures the group's
+mean flow (`group`, continuation scratch), so the units regulate one quantity, as parallel taps
+regulate one bus, and move by equal steps with their angle offsets kept (`offset`).
+
+`correction` holds a `PHASE_SHIFT_ANGLE`-mode impedance correction table, re-evaluated at every
+angle (in degrees, as PNM evaluates it); a `TAP_RATIO`-mode table depends only on the fixed
+ratio and is folded into `yt`."""
+mutable struct ControlledPhaseShifter <: AbstractBranchControl
+    name::String
+    from_ix::Int
+    to_ix::Int
+    metered::Int                     # 1: flow measured at winding 1 (from), 2: at winding 2
+    tap::Float64                     # fixed ratio
+    yt::ComplexF64                   # 1/(r+jx), divided by any angle-independent factor
+    y_shunt::ComplexF64              # primary (magnetizing) shunt, in the measured flow at winding 1
+    vset::Float64                    # band midpoint (p.u. MW); the target without a band
+    p_min::Float64                   # RMI1 (rad)
+    p_max::Float64                   # RMA1 (rad)
+    levels::Vector{Float64}          # discrete angles (rad); empty ⇒ continuous
+    nz_offsets::NTuple{4, Int}
+    initial::Float64
+    synced::Float64
+    current::Float64
+    correction::Union{Nothing, IS.PiecewiseLinearData}   # PHASE_SHIFT_ANGLE table, or nothing
+    band::Bool
+    v_lo::Float64                    # VMI1 / base (p.u.)
+    v_hi::Float64                    # VMA1 / base (p.u.)
+    side::Int
+    anchor::Float64
+    orientation::Int                 # always 0: oriented by the measured dP/dα
+    aligned::Int
+    offset::Float64
+    group::Vector{ControlledPhaseShifter}   # continuation scratch: parallel members, self included
+end
+
+# Tap-like branch devices: the parameter enters the 2×2 branch block through `t`.
+const BranchDevice = Union{ControlledTap, ControlledPhaseShifter}
+
 """The sign of dV/dp the continuation must use for device `d`, or 0 to use the measured one:
 a tap's PSS/E CONT-sign orientation (`tap_direction = :cont_sign`), else the sign its parallel
 group was aligned to (`_align_parallel_taps!`)."""
 _forced_sign(::AbstractControlledDevice) = 0
-_forced_sign(d::ControlledTap) = iszero(d.orientation) ? d.aligned : d.orientation
+_forced_sign(d::BranchDevice) = iszero(d.orientation) ? d.aligned : d.orientation
 
 """Slope of PNM's correction-table interpolation (`PNM._interpolate_correction_factor`) at
 `x`: the slope of the segment that interpolation uses there, and zero outside the table (the
@@ -113,6 +162,25 @@ end
     F = PNM._interpolate_correction_factor(curve, abs(p))
     y = d.yt / F
     return y, -y * _correction_factor_slope(curve, abs(p)) * sign(p) / F
+end
+
+"""Series admittance of phase shifter `d` at angle `α` (rad): `yt`, divided by the
+`PHASE_SHIFT_ANGLE` correction factor at `α` in degrees when a table is attached (PNM's own
+evaluation, so at the enrollment angle this is the Y-bus's corrected admittance)."""
+@inline function _series_admittance(d::ControlledPhaseShifter, α::Float64)
+    curve = d.correction
+    isnothing(curve) && return d.yt
+    return d.yt / PNM._interpolate_correction_factor(curve, rad2deg(α))
+end
+
+"""`(yt(α), dyt/dα)` for phase shifter `d` (α in rad; the table's x is degrees)."""
+@inline function _series_admittance_and_slope(d::ControlledPhaseShifter, α::Float64)
+    curve = d.correction
+    isnothing(curve) && return d.yt, zero(ComplexF64)
+    x = rad2deg(α)
+    F = PNM._interpolate_correction_factor(curve, x)
+    y = d.yt / F
+    return y, -y * _correction_factor_slope(curve, x) * (180 / π) / F
 end
 
 """Voltage-controlling switched shunt (PSS/E MODSW 1 discrete, 2 continuous).
@@ -285,6 +353,12 @@ struct ControlledDeviceSet
     # Tap device index by component name (`PSY.TapTransformer` names are unique), for
     # post-processing that recomputes a moved tap's branch flow at its solved ratio.
     tap_index::Dict{String, Int}
+    # Phase shifters (COD1 = 3), their per-ts angle store and index by component name: the
+    # fourth family, after FACTS in the continuation's [taps; shunts; facts; phase shifters]
+    # indexing. Like taps they mutate the shared Y-bus (reset-to-baseline per time step).
+    phase_shifters::Vector{ControlledPhaseShifter}
+    pst_current::Matrix{Float64}
+    pst_index::Dict{String, Int}
     # Perf counters for the last `_control_continuation!` (counts, not wall-clock; the regression
     # harness). symbolic_factors stays O(1) per continuation with PolarNRCache reuse. See getters.
     inner_solves::Base.RefValue{Int}
@@ -299,7 +373,8 @@ function ControlledDeviceSet(
     taps::Vector{ControlledTap},
     shunts::Vector{ControlledSwitchedShunt},
     facts::Vector{ControlledFACTS},
-    n_time_steps::Int = 1,
+    n_time_steps::Int = 1;
+    phase_shifters::Vector{ControlledPhaseShifter} = ControlledPhaseShifter[],
 )
     shunt_current = [d.current for d in shunts, _ in 1:n_time_steps]
     shunt_block_n = [copy(d.block_n) for d in shunts, _ in 1:n_time_steps]
@@ -318,6 +393,9 @@ function ControlledDeviceSet(
         facts_saturated,
         tap_current,
         Dict{String, Int}(d.name => i for (i, d) in enumerate(taps)),
+        phase_shifters,
+        [d.current for d in phase_shifters, _ in 1:n_time_steps],
+        Dict{String, Int}(d.name => i for (i, d) in enumerate(phase_shifters)),
         Ref(0),
         Ref(0),
         Ref(0),
@@ -326,7 +404,8 @@ function ControlledDeviceSet(
     )
 end
 function Base.isempty(s::ControlledDeviceSet)
-    return isempty(s.taps) && isempty(s.shunts) && isempty(s.facts)
+    return isempty(s.taps) && isempty(s.shunts) && isempty(s.facts) &&
+           isempty(s.phase_shifters)
 end
 
 """Load time step `ts`'s persisted state into the device scratch `_control_continuation!` mutates.
@@ -344,6 +423,9 @@ function load_device_state!(set::ControlledDeviceSet, data, ts::Int)
         d.saturated = set.facts_saturated[i, ts]
     end
     for d in set.taps
+        apply_parameter!(d, data, d.initial, ts)
+    end
+    for d in set.phase_shifters
         apply_parameter!(d, data, d.initial, ts)
     end
     return
@@ -365,6 +447,9 @@ function save_device_state!(set::ControlledDeviceSet, data, ts::Int)
     end
     for (i, d) in enumerate(set.taps)
         set.tap_current[i, ts] = d.current
+    end
+    for (i, d) in enumerate(set.phase_shifters)
+        set.pst_current[i, ts] = d.current
     end
     return
 end
@@ -450,6 +535,8 @@ stored_current(set::ControlledDeviceSet, ::ControlledSwitchedShunt, i::Int, ts::
     set.shunt_current[i, ts]
 stored_current(set::ControlledDeviceSet, ::ControlledFACTS, i::Int, ts::Int) =
     set.facts_current[i, ts]
+stored_current(set::ControlledDeviceSet, ::ControlledPhaseShifter, i::Int, ts::Int) =
+    set.pst_current[i, ts]
 
 # Result columns meaningful only for FACTS; taps/shunts report the neutral value so the
 # frame stays rectangular.
@@ -477,11 +564,11 @@ stored_parameter_limits(set::ControlledDeviceSet, ::ControlledFACTS, i::Int, ts:
 
 voltage_setpoint(d::AbstractControlledDevice) = d.vset
 
-# The two families with a PSS/E voltage band and a discrete grid: taps ([VMI1, VMA1]) and
-# switched shunts ([VSWLO, VSWHI]). The latch, clamp, directional snap and band settle below are
-# shared.
-const BandedDevice = Union{ControlledTap, ControlledSwitchedShunt}
-band_edges(d::ControlledTap) = (d.v_lo, d.v_hi)
+# The families with a PSS/E band and a discrete grid: taps ([VMI1, VMA1] in voltage), switched
+# shunts ([VSWLO, VSWHI]) and phase shifters ([VMI1, VMA1] in MW). The latch, clamp, directional
+# snap and band settle below are shared.
+const BandedDevice = Union{ControlledTap, ControlledSwitchedShunt, ControlledPhaseShifter}
+band_edges(d::BranchDevice) = (d.v_lo, d.v_hi)
 band_edges(d::ControlledSwitchedShunt) = (d.vset_lo, d.vset_hi)
 
 # A banded device regulates toward the edge it latched on; otherwise toward `vset`.
@@ -492,7 +579,7 @@ function control_setpoint(d::BandedDevice)
     d.side > 0 && return hi
     return d.vset
 end
-parameter_limits(d::ControlledTap) = (d.p_min, d.p_max)
+parameter_limits(d::BranchDevice) = (d.p_min, d.p_max)
 parameter_limits(d::ControlledSwitchedShunt) = (d.b_min, d.b_max)
 parameter_limits(d::ControlledFACTS) = (-d.b_lim, d.b_lim)
 current_parameter(d::AbstractControlledDevice) = d.current
@@ -519,7 +606,7 @@ function _in_deadband(d::ControlledSwitchedShunt, y::Float64)
     d.band && d.side != 0 && return false
     return d.vset_lo <= y <= d.vset_hi
 end
-_in_deadband(d::ControlledTap, y::Float64) = d.band && d.side == 0 && d.v_lo <= y <= d.v_hi
+_in_deadband(d::BranchDevice, y::Float64) = d.band && d.side == 0 && d.v_lo <= y <= d.v_hi
 
 # Band latch, updated from the measured regulated voltage `y` before each damped move.
 # Below the band ⇒ latch −1 (regulate up to the low edge), above ⇒ +1 (down to the high edge),
@@ -582,7 +669,7 @@ end
 # correction table re-evaluates at the new tap; its delta is exactly zero otherwise.
 # Correctness of the running sum relies on `old_tap` coming from `d.current` (the last
 # applied value), never read back from the nzval.
-function apply_parameter!(d::ControlledTap, data, p::Float64, ::Int)
+function apply_parameter!(d::BranchDevice, data, p::Float64, ::Int)
     A = data.power_network_matrix.data
     ff_old, ft_old, tf_old, tt_old = _branch_terms(d, d.current)
     ff_new, ft_new, tf_new, tt_new = _branch_terms(d, p)
@@ -617,8 +704,9 @@ end
 # Nearest discrete tap, except for a banded tap regulating toward an edge: the continuation left
 # it at the tap that puts its voltage on the edge, so the snap goes on in the direction it moved
 # (away from `anchor`) to the first level at or beyond it, the first position inside the band.
-function snap_to_discrete(d::ControlledTap, p::Float64)
+function snap_to_discrete(d::BranchDevice, p::Float64)
     pc = clamp(p, d.p_min, d.p_max)
+    isempty(d.levels) && return pc       # a continuous phase shifter (NTP1 < 2)
     dir = 0
     if d.band && d.side != 0
         dir = Int(sign(pc - d.anchor))
@@ -780,6 +868,65 @@ end
     return (yt / abs2(t), -yt / conj(t), -yt / t, yt)
 end
 
+# The four series terms of a phase shifter's branch block at angle `α`: a tap's with the ratio
+# fixed and the angle varying, `t = tap·e^{jα}` (PNM's stamp).
+@inline function _branch_terms(d::ControlledPhaseShifter, α::Float64)
+    t = d.tap * cis(α)
+    yt = _series_admittance(d, α)
+    return (yt / abs2(t), -yt / conj(t), -yt / t, yt)
+end
+
+# Active power entering the branch at terminal i, P_i = Re(V_i·conj(Y_ii·V_i + Y_ij·V_j)), and
+# its partials with respect to (|V_i|, |V_j|, θ_i, θ_j) and, through (dY_ii, dY_ij), the angle.
+@inline function _terminal_p_partials(Vi::ComplexF64, Vj::ComplexF64, Yii::ComplexF64,
+    Yij::ComplexF64, dYii::ComplexF64, dYij::ComplexF64)
+    vi, vj = abs(Vi), abs(Vj)
+    A = conj(Yij) * Vi * conj(Vj)
+    G = real(Yii)
+    P = vi^2 * G + real(A)
+    dvi = 2 * vi * G + (iszero(vi) ? 0.0 : real(A) / vi)
+    dvj = iszero(vj) ? 0.0 : real(A) / vj
+    dθi = -imag(A)
+    dθj = imag(A)
+    dα = vi^2 * real(dYii) + real(conj(dYij) * Vi * conj(Vj))
+    return P, dvi, dvj, dθi, dθj, dα
+end
+
+# One unit's winding-1 → winding-2 active power at its metered end, and its partials: at winding 1
+# P_f (the primary shunt included, as the reported flow), at winding 2 −P_t. Returns
+# (P, ∂/∂|V_f|, ∂/∂|V_t|, ∂/∂θ_f, ∂/∂θ_t, ∂/∂α).
+function _metered_flow_partials(d::ControlledPhaseShifter, data, ts::Int)
+    f, t = d.from_ix, d.to_ix
+    Vf = data.bus_magnitude[f, ts] * cis(data.bus_angles[f, ts])
+    Vt = data.bus_magnitude[t, ts] * cis(data.bus_angles[t, ts])
+    ff, ft, tf, tt = _branch_terms(d, d.current)
+    dff, dft, dtf, dtt = _branch_term_slopes(d, d.current)
+    if d.metered == 2
+        P, dvt, dvf, dθt, dθf, dα = _terminal_p_partials(Vt, Vf, tt, tf, dtt, dtf)
+        return -P, -dvf, -dvt, -dθf, -dθt, -dα
+    end
+    return _terminal_p_partials(Vf, Vt, ff + d.y_shunt, ft, dff, dft)
+end
+
+# ∂/∂α of the four branch terms (ff, ft, tf, tt) at α: with t = a·e^{jα}, ∂(1/conj(t))/∂α =
+# j/conj(t) and ∂(1/t)/∂α = −j/t, so ∂ft = j·ft and ∂tf = −j·tf, plus yt's correction slope.
+@inline function _branch_term_slopes(d::ControlledPhaseShifter, α::Float64)
+    t = d.tap * cis(α)
+    yt, dyt = _series_admittance_and_slope(d, α)
+    ft = -yt / conj(t)
+    tf = -yt / t
+    return (dyt / abs2(t), im * ft - dyt / conj(t), -im * tf - dyt / t, dyt)
+end
+
+_metered_flow(d::ControlledPhaseShifter, data, ts::Int) =
+    first(_metered_flow_partials(d, data, ts))
+
+# A phase shifter regulates its metered MW flow; a member of a parallel group the group's mean.
+function measured_value(d::ControlledPhaseShifter, data, ts::Int)
+    isempty(d.group) && return _metered_flow(d, data, ts)
+    return sum(m -> _metered_flow(m, data, ts), d.group) / length(d.group)
+end
+
 # Delta-update the from/to arc-admittance rows to `d.current` (parallel branches sharing the arc
 # row are preserved; `d.synced` tracks the reflected value). Reported flows are computed from
 # these matrices right after each time step, so an unsynced branch would report flows at its
@@ -787,7 +934,7 @@ end
 function _sync_branch_arc_rows!(
     Yft::SparseArrays.SparseMatrixCSC,
     Ytf::SparseArrays.SparseMatrixCSC,
-    d::ControlledTap,
+    d::BranchDevice,
     arc_row::Dict{Tuple{Int, Int}, Int},
     ix_to_number::Dict{Int, Int},
 )
@@ -836,11 +983,14 @@ function _sync_arc_admittances!(data, set::ControlledDeviceSet)
     Yft = data.power_network_matrix.arc_admittance_from_to
     Ytf = data.power_network_matrix.arc_admittance_to_from
     (isnothing(Yft) || isnothing(Ytf)) && return
-    isempty(set.taps) && return
+    isempty(set.taps) && isempty(set.phase_shifters) && return
     bus_lookup = PNM.get_bus_lookup(Yft)
     ix_to_number = Dict{Int, Int}(v => k for (k, v) in bus_lookup)
     arc_row = get_arc_lookup(data)   # (from_no, to_no) => arc row index
     for d in set.taps
+        _sync_branch_arc_rows!(Yft.data, Ytf.data, d, arc_row, ix_to_number)
+    end
+    for d in set.phase_shifters
         _sync_branch_arc_rows!(Yft.data, Ytf.data, d, arc_row, ix_to_number)
     end
     return
