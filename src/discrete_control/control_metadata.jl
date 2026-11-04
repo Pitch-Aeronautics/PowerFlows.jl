@@ -214,6 +214,23 @@ function _tap_cont1(tx)
     return c
 end
 
+"""Whether a `TapTransformer` carries PSS/E data saying it has no controlled bus: a CONT1 of 0
+in `ext["CONT1"]` (PowerSystems' PSS/E parser), `ext["psse"]["CONT1"]` or `ext["psse"]["cont1"]`
+(the first of these present decides). PSS/E adjusts a COD1 = ±1 winding only toward a controlled
+bus; with CONT1 = 0 it keeps the stored ratio. Without any CONT1 (an API-built tap) the tap
+regulates its `to` bus, as before."""
+function _tap_cont1_zero(tx)
+    ext = PSY.get_ext(tx)
+    c = get(ext, "CONT1", nothing)
+    if !(c isa Real)
+        psse = get(ext, "psse", nothing)
+        psse isa AbstractDict || return false
+        c = get(psse, "CONT1", nothing)
+        c isa Real || (c = get(psse, "cont1", nothing))
+    end
+    return c isa Real && iszero(c) && iszero(PSY.get_regulated_bus_number(tx))
+end
+
 """Orientation of a tap under PSS/E's CONT convention. The tap ratio is the winding-1 (`from`)
 ratio, so for a bus on the winding-2 side raising it lowers the voltage (−1), and for one on the
 winding-1 side it raises it (+1). PSS/E places the controlled bus by position first: a CONT1
@@ -316,6 +333,11 @@ function build_controlled_device_set(
         PSY.get_control_objective(tx) == PSY.TransformerControlObjective.VOLTAGE ||
             continue
         name = PSY.get_name(tx)
+        if _tap_cont1_zero(tx)
+            @debug "ControlledTap \"$name\": PSS/E CONT1 = 0 (no controlled bus); held at \
+                its stored ratio, as PSS/E does."
+            continue
+        end
         arc = PSY.get_arc(tx)
         fb = PSY.get_number(PSY.get_from(arc))
         tb = PSY.get_number(PSY.get_to(arc))

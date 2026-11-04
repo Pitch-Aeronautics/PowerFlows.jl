@@ -244,3 +244,54 @@ end
         @test t1.offset ≈ (1.05 - 0.95625) / 2 && t2.offset ≈ -(1.05 - 0.95625) / 2
     end
 end
+
+# GAP-058 recurrence (27HSP1p): of a parallel pair, one unit is fixed (COD1 = 0) and the other a
+# voltage-controlling winding (COD1 = 1) with CONT1 = 0, its `to` bus outside its band in the
+# stored state. PSS/E adjusts a winding only toward a controlled bus, so with CONT1 = 0 it keeps
+# the stored ratio; PowerFlows read regulated_bus_number 0 as the `to` bus and stepped the unit 14
+# positions while its fixed twin held. A tap whose PSS/E CONT1 is 0 is now held.
+function _cont1_zero_pair(cont1)
+    sys = System(100.0)
+    b1 = _add_simple_bus!(sys, 1, ACBusTypes.REF, 230, 1.0, 0.0)
+    _add_simple_source!(sys, b1, 0.0, 0.0)
+    bs = _add_simple_bus!(sys, 2, ACBusTypes.PQ, 230, 1.0, 0.0)
+    br = _add_simple_bus!(sys, 3, ACBusTypes.PV, 115, 1.048, 0.0)   # a plant on the low side
+    _add_simple_thermal_standard!(sys, br, 0.3, 0.0)
+    _add_simple_line!(sys, b1, bs, 0.002, 0.15, 0.0)
+    _add_simple_load!(sys, bs, 80.0, 40.0)
+    _add_simple_load!(sys, br, 20.0, 5.0)
+    for (nm, ctl) in (("fixed", false), ("ctl", true))
+        ext = Dict{String, Any}("VMI1" => 1.035, "VMA1" => 1.05)
+        cont1 === :psse && (ext["psse"] = Dict{String, Any}("cont1" => 0))
+        cont1 === :ext && (ext["CONT1"] = 0)
+        add_component!(sys, TapTransformer(; name = nm, available = true,
+            active_power_flow = 0.0, reactive_power_flow = 0.0,
+            arc = Arc(; from = br, to = bs), r = 0.002, x = 0.07, primary_shunt = 0.0im,
+            tap = 1.0875, rating = 1.0, base_power = 100.0,
+            control_objective = ctl ? PSY.TransformerControlObjective.VOLTAGE :
+                                PSY.TransformerControlObjective.UNDEFINED,
+            voltage_setpoint = (1.035 + 1.05) / 2, ext = ext))
+    end
+    return sys
+end
+
+@testset "tap direction: a voltage tap with PSS/E CONT1 = 0 keeps its ratio (GAP-058 recurrence)" begin
+    for cont1 in (:ext, :psse, :none), direction in (:sensitivity, :cont_sign)
+        sys = _cont1_zero_pair(cont1)
+        base = PowerFlowData(ACPolarPowerFlow(), sys)
+        @test solve_power_flow!(base)
+        @test base.bus_magnitude[PF.get_bus_lookup(base)[2], 1] < 1.035   # `to` bus out of band
+        pf = ACPolarPowerFlow(; control_discrete_devices = true, tap_direction = direction)
+        data = PowerFlowData(pf, _cont1_zero_pair(cont1))
+        @test solve_power_flow!(data)
+        set = PF.get_controlled_devices(data)
+        if cont1 === :none
+            # No PSS/E CONT1 (an API-built tap): it regulates its `to` bus, as before.
+            d = only(set.taps)
+            @test abs(d.current - d.initial) > 0.01
+        else
+            @test isnothing(set) || isempty(set.taps)
+            @test data.bus_magnitude[:, 1] ≈ base.bus_magnitude[:, 1] atol = 1e-10
+        end
+    end
+end
