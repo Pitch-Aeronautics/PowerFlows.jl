@@ -376,6 +376,7 @@ function _ac_power_flow(
     time_step::Int64;
     kwargs...,
 )
+    _check_remote_voltage_solver(pf, data)
     _reset_q_limit_flip_flops!(data, time_step)
     cd = data.controlled_devices
     if isnothing(cd) || isempty(cd)

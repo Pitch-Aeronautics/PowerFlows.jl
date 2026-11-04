@@ -31,7 +31,8 @@
 # - `IREG`: the regulated bus number; 0, absent or the unit's own bus is local
 #   (`_generator_remote_bus`).
 # - `RMPCT`: the unit's percent share; absent ⇒ 100 (PSS/E's default); not positive ⇒ 100 with a
-#   warning. A plant is the available generators at a bus: its share is their RMPCT sum, its
+#   warning. A plant is the available generators at a bus: its share is its RMPCT counted once
+#   per PSS/E bus (`_rv_plant_share`), its
 #   limits their summed Q limits; other injections at the bus (FACTS, sources) stay fixed.
 # - `VS`: the scheduled voltage of the regulated bus. Absent ⇒ X's stored |V| (PowerSystems'
 #   v33 reader keeps IREG and RMPCT but drops VS, and its v35 reader drops IREG and RMPCT).
@@ -57,7 +58,9 @@ regulates a remote bus, or when `remote_voltage_control` is off.
 - `regulated_group[ix]`: the group whose regulated bus is `ix`, else 0.
 - `member_group[ix]`: the group whose member plant sits at `ix` (the regulated bus's own plant
   included), else 0.
-- `status[row, ts]`: 0 sharing, +1 fixed at its bus's Qmax, −1 fixed at its Qmin.
+- `status[row, ts]`: 0 sharing, +1 fixed at its bus's Qmax, −1 fixed at its Qmin, `RV_RELEASED`
+  out of its group (`remote_voltage_release!`: its plant out of service, its bus dead or away from
+  X, or X gone): no share, no injection written, no limit check, its bus an ordinary bus again.
 - `q_base[g, ts]`: the regulated bus's reactive injection outside the group (its stored injection
   when it has no regulating plant of its own, else 0).
 - `q_fixed[row, ts]`: a member bus's reactive injection outside its plant (FACTS, sources and
@@ -78,6 +81,9 @@ mutable struct RemoteVoltageControl
     q_held::Matrix{Float64}
     returns::Dict{Tuple{Int, Int}, Int}
 end
+
+"""Member status of a plant taken out of its group (`remote_voltage_release!`)."""
+const RV_RELEASED = Int8(2)
 
 RemoteVoltageControl() = RemoteVoltageControl(
     RemoteVoltageGroup[], Int[], Int[], zeros(Int8, 0, 0), zeros(0, 0), zeros(0, 0),
@@ -137,6 +143,25 @@ function _generator_rmpct(g)
     return Float64(r)
 end
 
+"""A plant's RMPCT share, counted as PSS/E counts it: once per PSS/E bus (every machine record at a
+bus carries its plant's RMPCT, so two machines at 20 % share as one plant at 20 %), the largest
+over that bus's available machines (with a warning when they disagree), summed over the PSS/E buses
+a zero-impedance reduction merged into this one."""
+function _rv_plant_share(gens)
+    per_bus = Dict{Int, Float64}()
+    for g in gens
+        n = PSY.get_number(PSY.get_bus(g))
+        r = _generator_rmpct(g)
+        prev = get(per_bus, n, nothing)
+        if !isnothing(prev) && abs(prev - r) > 1e-9
+            @warn "Generators at bus $n carry different RMPCT ($prev, $r); PSS/E keeps one per \
+                plant: using the largest." maxlog = PF_MAX_LOG
+        end
+        per_bus[n] = isnothing(prev) ? r : max(prev, r)
+    end
+    return sum(values(per_bus); init = 0.0)
+end
+
 """A generator's scheduled voltage for its regulated bus (`ext["VS"]` or
 `ext["psse"]["VS"/"vs"]`), or `nothing`."""
 function _generator_remote_setpoint(g)
@@ -149,6 +174,19 @@ _remote_voltage_enabled(pf::PowerFlowEvaluationModel) = get_remote_voltage_contr
 _remote_voltage_enabled(
     ::ACPolarPowerFlow{<:FastDecoupledACPowerFlow},
 ) = false
+
+# The fast decoupled solvers do not model remote regulation (their explicit PV update closes a
+# regulated bus's own Q row with its Q_tot slot), so a solve of data that holds remote-regulation
+# groups with one of them is refused rather than solved wrong. Data built for a fast decoupled solver
+# has no groups (`_enroll_remote_voltage_control!`).
+_check_remote_voltage_solver(::PowerFlowEvaluationModel, data) = nothing
+function _check_remote_voltage_solver(::ACPolarPowerFlow{<:FastDecoupledACPowerFlow}, data)
+    has_remote_voltage_groups(data.remote_voltage_control) || return
+    throw(ArgumentError("this PowerFlowData holds remote voltage regulation groups (built with \
+        remote_voltage_control = true), which the fast decoupled solver does not model; solve it \
+        with Newton-Raphson, trust region or Levenberg-Marquardt, or build the data for the fast \
+        decoupled solver (or with remote_voltage_control = false)."))
+end
 
 function _any_remote_generator(sys)
     for g in PSY.get_available_components(PSY.Generator, sys)
@@ -190,7 +228,7 @@ function _enroll_remote_voltage_control!(data, pf, sys)
     vs = Dict{Int, Union{Nothing, Float64}}()
     for bix in sort!(collect(keys(units)))
         gs = sort!(units[bix]; by = PSY.get_name)
-        per = Dict{Int, Float64}()
+        per = Dict{Int, Vector{Any}}()
         for g in gs
             r = _generator_remote_bus(g)
             rix = isnothing(r) ? bix : _resolve_bus_ix(bus_lookup, rmap, r)
@@ -199,9 +237,9 @@ function _enroll_remote_voltage_control!(data, pf, sys)
                     the (reduced) network; it holds its own terminal." maxlog = PF_MAX_LOG
                 rix = bix
             end
-            per[rix] = get(per, rix, 0.0) + _generator_rmpct(g)
+            push!(get!(per, rix, Any[]), g)
         end
-        t = argmax(k -> (per[k], -k), collect(keys(per)))
+        t = argmax(k -> (_rv_plant_share(per[k]), -k), collect(keys(per)))
         if length(per) > 1
             @warn "Generators at bus $(numbers[bix]) regulate different buses (IREG); the \
                 plant regulates bus $(numbers[t]), the target of the largest RMPCT." maxlog =
@@ -209,7 +247,7 @@ function _enroll_remote_voltage_control!(data, pf, sys)
         end
         data.bus_type[bix, 1] == PSY.ACBusTypes.PV || continue
         target[bix] = t
-        share[bix] = sum(values(per))
+        share[bix] = _rv_plant_share(gs)
         vs[bix] = nothing
         for g in gs
             v = _generator_remote_setpoint(g)
@@ -407,6 +445,11 @@ function _apply_remote_voltage_injections!(
         qx = rvc.q_base[g, ts]
         for (k, b) in enumerate(grp.members)
             st = rvc.status[grp.offset + k, ts]
+            if st == RV_RELEASED
+                # An ordinary bus now, its row its own; X keeps only its non-plant part.
+                b == X && (qx += rvc.q_fixed[grp.offset + k, ts])
+                continue
+            end
             q = if st == 0
                 S > 0.0 ? grp.shares[k] / S * Qt : 0.0
             else
@@ -550,7 +593,7 @@ function _remote_voltage_q_limits!(data, ts::Int)
             for (k, b) in enumerate(grp.members)
                 row = grp.offset + k
                 st = rvc.status[row, ts]
-                st == 0 && continue
+                (st == 0 || st == RV_RELEASED) && continue
                 lo, hi = rvc.q_bounds[grp.offset + k]
                 hi - lo > BOUNDS_TOLERANCE || continue     # a fixed-Q plant cannot share
                 q = grp.shares[k] * λ
@@ -560,6 +603,9 @@ function _remote_voltage_q_limits!(data, ts::Int)
             end
         else
             any(k -> rvc.status[grp.offset + k, ts] == 0, eachindex(grp.members)) &&
+                continue
+            # Dissolved (every plant released): X stays PQ, nothing to return.
+            all(k -> rvc.status[grp.offset + k, ts] == RV_RELEASED, eachindex(grp.members)) &&
                 continue
             V = data.bus_magnitude[X, ts]
             tol = Q_LIMIT_RETURN_VOLTAGE_TOLERANCE
@@ -610,6 +656,12 @@ function _rv_set_fixed_injections!(data, rvc, g::Int, grp::RemoteVoltageGroup, t
     for (k, b) in enumerate(grp.members)
         st = rvc.status[grp.offset + k, ts]
         st == 0 && continue
+        if st == RV_RELEASED
+            # A released plant's row is its own; at X only the non-plant part stays.
+            b == X && (data.bus_reactive_power_injections[X, ts] =
+                rvc.q_base[g, ts] + rvc.q_fixed[grp.offset + k, ts])
+            continue
+        end
         q = _rv_held(rvc, grp.offset + k, ts) + rvc.q_fixed[grp.offset + k, ts]
         data.bus_reactive_power_injections[b, ts] = b == X ? rvc.q_base[g, ts] + q : q
     end
@@ -632,6 +684,7 @@ function get_reported_bus_type(data, ix::Int, ts::Int)
     if g != 0
         grp = rvc.groups[g]
         k = findfirst(==(ix), grp.members)
+        rvc.status[grp.offset + k, ts] == RV_RELEASED && return bt
         sharing = rvc.status[grp.offset + k, ts] == 0 &&
                   data.bus_type[grp.regulated_ix, ts] == PSY.ACBusTypes.PV
         return sharing ? PSY.ACBusTypes.PV : PSY.ACBusTypes.PQ
@@ -651,4 +704,168 @@ function get_remote_voltage_status(data, time_step::Int = 1)
             (grp.member_numbers[k], grp.shares[k], Int(rvc.status[grp.offset + k, time_step]))
             for k in eachindex(grp.members)
         ] for grp in rvc.groups)
+end
+
+# ── Editing groups in place (contingency analysis) ───────────────────────────────────────────
+# A contingency engine that applies outages to a built `PowerFlowData` in place (instead of
+# rebuilding it from the edited System) uses these to keep the groups right. None of them adds or
+# removes a Jacobian structural entry, so the cached structure stays valid; each one marks the NR
+# factorization's pivots stale. The role vectors (`member_group`, `regulated_group`) are shared by
+# every time step: in multi-period data, apply an edit at every time step.
+
+"""Whether bus row `ix` is a regulated bus or a member plant's bus of a remote-regulation group."""
+is_remote_voltage_bus(data, ix::Int) = _rv_role(data.remote_voltage_control, ix)
+
+"""
+    remote_voltage_release!(data, ix, ts = 1; hold_terminal = false, at = :present) -> Symbol
+
+Take the plant at bus row `ix` out of its group (status `RV_RELEASED`, `member_group[ix] = 0`): it
+has no share and the group writes no injection for it, so its bus is an ordinary bus again, whose
+injection, bounds and type are the caller's. With `hold_terminal` (its bus live, a source left on
+it) a remote plant's bus becomes PV and holds its own terminal, at its present |V| (`at = :present`,
+what a fresh build gives a plant whose regulated bus is gone) or at the group's setpoint
+(`at = :vs`, PSS/E's rule for a plant whose IREG bus is not a type 1 or 2 bus, as recalled from the
+POM's generator data notes). The plant at X itself leaves X regulated by the others; X keeps only
+its non-plant injection.
+
+Then the group: `:sharing` (a plant still shares; X stays PV), `:saturated` (every plant left is at
+a limit: X PQ at its present |V|, and the return rule may bring it back), `:dissolved` (no plant
+left: X PQ at its present |V| for good, `regulated_group[X] = 0`), or `:none` (`ix` is in no
+group).
+"""
+function remote_voltage_release!(data, ix::Int, ts::Int = 1; hold_terminal::Bool = false,
+    at::Symbol = :present)
+    at in (:present, :vs) || throw(ArgumentError("at must be :present or :vs; got :$at"))
+    rvc = data.remote_voltage_control
+    (isempty(rvc.member_group) || rvc.member_group[ix] == 0) && return :none
+    g = rvc.member_group[ix]
+    grp = rvc.groups[g]
+    k = findfirst(==(ix), grp.members)
+    X = grp.regulated_ix
+    was_pv = data.bus_type[X, ts] == PSY.ACBusTypes.PV
+    rvc.status[grp.offset + k, ts] = RV_RELEASED
+    rvc.member_group[ix] = 0
+    if ix != X && hold_terminal
+        data.bus_type[ix, ts] = PSY.ACBusTypes.PV
+        at === :vs && (data.bus_magnitude[ix, ts] = grp.vset)
+    end
+    _rv_set_fixed_injections!(data, rvc, g, grp, ts)
+    _rv_drop_pivots!(data)
+    released(k) = rvc.status[grp.offset + k, ts] == RV_RELEASED
+    if all(released, eachindex(grp.members))
+        data.bus_type[X, ts] = PSY.ACBusTypes.PQ
+        rvc.regulated_group[X] = 0
+        return :dissolved
+    end
+    if was_pv && iszero(_rv_active_share(rvc, grp, ts))
+        data.bus_type[X, ts] = PSY.ACBusTypes.PQ
+    end
+    return data.bus_type[X, ts] == PSY.ACBusTypes.PV ? :sharing : :saturated
+end
+
+# The available generators at bus row `ix` (the enrolment's plant), re-read from `sys`.
+function _rv_available_units(data, sys, ix::Int)
+    nrd = PNM.get_network_reduction_data(data.power_network_matrix)
+    bus_lookup = get_bus_lookup(data)
+    rmap = PNM.get_reverse_bus_search_map(nrd)
+    return [g for g in PSY.get_available_components(PSY.Generator, sys) if
+            _resolve_bus_ix(bus_lookup, rmap, PSY.get_number(PSY.get_bus(g))) == ix]
+end
+
+"""
+    remote_voltage_refresh!(data, sys, ix, ts = 1) -> Symbol
+
+Re-read the plant at bus row `ix` from `sys` after its units changed (in system base units, as
+`PowerFlowData` is built): its share (the RMPCT sum of its available generators), its limits and its
+non-plant part (`q_fixed`: the row's present injection, which the caller has recomputed from the
+System, less the plant's stored Q). A plant with no available generator left is released
+(`remote_voltage_release!`, which this returns). At a regulated bus without a plant of its own,
+refreshes `q_base` from the row's injection. Returns `:sharing`, `:refreshed` (X's `q_base`), or
+`:none`.
+"""
+function remote_voltage_refresh!(data, sys, ix::Int, ts::Int = 1)
+    rvc = data.remote_voltage_control
+    isempty(rvc.regulated_group) && return :none
+    out = :none
+    gx = rvc.regulated_group[ix]
+    if gx != 0 && rvc.member_group[ix] != gx
+        rvc.q_base[gx, ts] = data.bus_reactive_power_injections[ix, ts]
+        out = :refreshed
+    end
+    g = rvc.member_group[ix]
+    g == 0 && return out
+    gens = _rv_available_units(data, sys, ix)
+    isempty(gens) && return remote_voltage_release!(data, ix, ts)
+    grp = rvc.groups[g]
+    k = findfirst(==(ix), grp.members)
+    row = grp.offset + k
+    grp.shares[k] = _rv_plant_share(gens)
+    q_plant, lo, hi = _rv_plant_q_and_bounds(gens, nothing)
+    rvc.q_bounds[row] = (lo, hi)
+    ix == grp.regulated_ix && (rvc.q_base[g, ts] = 0.0)
+    rvc.q_fixed[row, ts] = data.bus_reactive_power_injections[ix, ts] - q_plant
+    _rv_drop_pivots!(data)
+    return :sharing
+end
+
+"""
+    remote_voltage_islands!(data, island, dead, ts = 1; swing = falses(length(dead)))
+
+After a topology change, with `island[i]` the component of bus row `i`, `dead[i]` a row out of the
+solve and `swing[i]` a row made a reference bus: a group whose X is dead or a reference bus is
+dissolved, each live plant released holding its own terminal at its present |V| (the fresh build's
+rules for a regulated bus out of the network or a reference bus); a dead plant is released; a plant
+that became a reference bus is released (the row is the caller's REF); a live plant in another
+island than X is released holding its own terminal (enrolment's "another island" rule). Returns
+the number of plants released.
+"""
+function remote_voltage_islands!(data, island::AbstractVector{<:Integer},
+    dead::AbstractVector{Bool}, ts::Int = 1; swing::AbstractVector{Bool} = falses(length(dead)))
+    rvc = data.remote_voltage_control
+    n = 0
+    for grp in rvc.groups
+        X = grp.regulated_ix
+        rvc.regulated_group[X] == 0 && continue          # already dissolved
+        x_gone = dead[X] || swing[X]
+        for (k, b) in enumerate(grp.members)
+            rvc.status[grp.offset + k, ts] == RV_RELEASED && continue
+            live = !dead[b] && !swing[b]
+            if x_gone || !live || island[b] != island[X]
+                remote_voltage_release!(data, b, ts; hold_terminal = live && b != X)
+                n += 1
+            end
+        end
+    end
+    return n
+end
+
+"""Everything an in-place edit may change in `data`'s remote-regulation groups, for an exact
+restore with [`restore_remote_voltage!`](@ref): member status, rejoin counts, shares, plant
+limits, fixed parts, held Q and the role vectors."""
+function remote_voltage_snapshot(data)
+    rvc = data.remote_voltage_control
+    return (status = copy(rvc.status), returns = copy(rvc.returns),
+        shares = [copy(grp.shares) for grp in rvc.groups], q_bounds = copy(rvc.q_bounds),
+        q_fixed = copy(rvc.q_fixed), q_base = copy(rvc.q_base), q_held = copy(rvc.q_held),
+        regulated_group = copy(rvc.regulated_group), member_group = copy(rvc.member_group))
+end
+
+"""Put back a [`remote_voltage_snapshot`](@ref) of the same `data` (bus types, magnitudes and
+injections are the caller's to restore)."""
+function restore_remote_voltage!(data, s)
+    rvc = data.remote_voltage_control
+    copyto!(rvc.status, s.status)
+    empty!(rvc.returns)
+    merge!(rvc.returns, s.returns)
+    for (grp, sh) in zip(rvc.groups, s.shares)
+        copyto!(grp.shares, sh)
+    end
+    copyto!(rvc.q_bounds, s.q_bounds)
+    copyto!(rvc.q_fixed, s.q_fixed)
+    copyto!(rvc.q_base, s.q_base)
+    copyto!(rvc.q_held, s.q_held)
+    copyto!(rvc.regulated_group, s.regulated_group)
+    copyto!(rvc.member_group, s.member_group)
+    _rv_drop_pivots!(data)
+    return
 end

@@ -531,3 +531,195 @@ end
     data = PowerFlowData(ACPolarPowerFlow(; check_reactive_power_limits = true), sys)
     @test data.bus_type[PF.get_bus_lookup(data)[3], 1] == ACBusTypes.PV
 end
+
+# ── In-place group edits (contingency analysis) ──────────────────────────────────────────────
+# An outage applied to a built PowerFlowData: the caller edits the rows (here, a unit out: its
+# bus's P and Q injection and bounds go, the bus PQ), and the fork edits the group. Each result is
+# checked against a fresh build of the System with the same outage.
+
+# The unit at bus `n` out of `data` in place, as a contingency runner's row edit would do.
+function _rv_unit_out!(data, bl, n; p = 0.3)
+    data.bus_active_power_injections[bl[n], 1] -= p
+    data.bus_reactive_power_injections[bl[n], 1] = 0.0
+    data.bus_reactive_power_bounds[bl[n], 1] = (0.0, 0.0)
+    data.bus_type[bl[n], 1] = ACBusTypes.PQ
+    return
+end
+
+# A fresh build with the unit at bus `n` unavailable and its bus PQ.
+function _rv_fresh_without(n; q = false, kw...)
+    sys = _rv_system(; kw...)
+    g = only(get_components(x -> get_number(get_bus(x)) == n, ThermalStandard, sys))
+    set_available!(g, false)
+    set_bustype!(get_bus(sys, n), ACBusTypes.PQ)
+    data = PowerFlowData(ACPolarPowerFlow(; check_reactive_power_limits = q), sys)
+    @test solve_power_flow!(data)
+    return data, PF.get_bus_lookup(data)
+end
+
+@testset "remote voltage control: in place, a released plant leaves its share to the rest (GAP-015)" begin
+    data, bl = _rv_solve(; units = _RV_AB)
+    @test PF.is_remote_voltage_bus(data, bl[4]) && PF.is_remote_voltage_bus(data, bl[3])
+    @test !PF.is_remote_voltage_bus(data, bl[5])
+    _rv_unit_out!(data, bl, 4)
+    @test PF.remote_voltage_release!(data, bl[4]) == :sharing
+    @test !PF.is_remote_voltage_bus(data, bl[4])
+    @test PF.get_remote_voltage_status(data)[3][2][3] == PF.RV_RELEASED
+    @test PF.get_reported_bus_type(data, bl[4], 1) == ACBusTypes.PQ
+    @test solve_power_flow!(data)
+    fresh, fbl = _rv_fresh_without(4; units = _RV_AB)
+    @test _rv_v(data, bl, 3) ≈ 1.02 atol = 1e-9
+    @test _rv_q(data, bl, 4) == 0.0
+    for n in (1, 2, 3, 4, 5)
+        @test _rv_v(data, bl, n) ≈ _rv_v(fresh, fbl, n) atol = 1e-8
+    end
+    @test _rv_q(data, bl, 2) ≈ _rv_q(fresh, fbl, 2) atol = 1e-8
+    @test PF.remote_voltage_release!(data, bl[5]) == :none
+end
+
+@testset "remote voltage control: in place, release holding the terminal, saturate, dissolve (GAP-015)" begin
+    # Holding its terminal (its regulated bus gone): PV at its present |V|, or at VS.
+    base, bl = _rv_solve(; units = _RV_AB)
+    v4 = _rv_v(base, bl, 4)
+    data, bl = _rv_solve(; units = _RV_AB)
+    @test PF.remote_voltage_release!(data, bl[4]; hold_terminal = true) == :sharing
+    @test data.bus_type[bl[4], 1] == ACBusTypes.PV && data.bus_magnitude[bl[4], 1] == v4
+    @test solve_power_flow!(data)
+    @test _rv_v(data, bl, 4) ≈ v4 atol = 1e-12
+    @test _rv_v(data, bl, 3) ≈ 1.02 atol = 1e-9
+    # (a fresh build of the same: the unit local, its bus at that |V|)
+    sys = _rv_system(; units = [_RV_AB[1], merge(_RV_AB[2], (ireg = 0,))])
+    set_magnitude!(get_bus(sys, 4), v4)
+    fresh = PowerFlowData(ACPolarPowerFlow(), sys)
+    @test solve_power_flow!(fresh)
+    @test data.bus_magnitude[:, 1] ≈ fresh.bus_magnitude[:, 1] atol = 1e-8
+    data, bl = _rv_solve(; units = _RV_AB)
+    PF.remote_voltage_release!(data, bl[4]; hold_terminal = true, at = :vs)
+    @test data.bus_magnitude[bl[4], 1] == 1.02
+    @test_throws ArgumentError PF.remote_voltage_release!(data, bl[2]; at = :other)
+    # The plant left at its limit: the group saturates, X PQ.
+    capped = [merge(_RV_AB[1], (qmax = 0.1,)), _RV_AB[2]]
+    data, bl = _rv_solve(; units = capped, q = true)
+    _rv_unit_out!(data, bl, 4)
+    @test PF.remote_voltage_release!(data, bl[4]) == :saturated
+    @test data.bus_type[bl[3], 1] == ACBusTypes.PQ
+    @test solve_power_flow!(data)
+    fresh, fbl = _rv_fresh_without(4; units = capped, q = true)
+    @test data.bus_magnitude[:, 1] ≈ fresh.bus_magnitude[:, 1] atol = 1e-8
+    @test _rv_q(data, bl, 2) ≈ 0.1 atol = 1e-9
+    # No plant left: the group dissolves, X PQ for good.
+    one = [(bus = 2, ireg = 3, rmpct = 100.0, qmin = -3.0, qmax = 3.0)]
+    data, bl = _rv_solve(; units = one, q = true)
+    _rv_unit_out!(data, bl, 2)
+    @test PF.remote_voltage_release!(data, bl[2]) == :dissolved
+    @test !PF.is_remote_voltage_bus(data, bl[3]) && data.bus_type[bl[3], 1] == ACBusTypes.PQ
+    @test solve_power_flow!(data)
+    fresh, fbl = _rv_fresh_without(2; units = one, q = true)
+    @test data.bus_magnitude[:, 1] ≈ fresh.bus_magnitude[:, 1] atol = 1e-8
+    @test PF._check_q_limit_bounds!(data, 1)          # a dissolved group never returns
+end
+
+@testset "remote voltage control: in place, X's own plant released, the remote one holds X (GAP-015)" begin
+    own = [(bus = 3, ireg = 0, rmpct = 50.0, qmin = -3.0, qmax = 3.0),
+        (bus = 2, ireg = 3, rmpct = 50.0, qmin = -3.0, qmax = 3.0)]
+    kw = (; units = own, x_type = ACBusTypes.PV, x_vm = 1.02)
+    data, bl = _rv_solve(; kw...)
+    data.bus_active_power_injections[bl[3], 1] -= 0.3
+    data.bus_reactive_power_bounds[bl[3], 1] = (0.0, 0.0)
+    @test PF.remote_voltage_release!(data, bl[3]) == :sharing
+    @test data.bus_type[bl[3], 1] == ACBusTypes.PV            # still held, by the remote plant
+    @test PF.is_remote_voltage_bus(data, bl[3])
+    @test solve_power_flow!(data)
+    @test _rv_v(data, bl, 3) ≈ 1.02 atol = 1e-9
+    @test _rv_q(data, bl, 3) ≈ 0.0 atol = 1e-12
+    fresh, fbl = _rv_fresh_without(3; kw...)
+    @test data.bus_magnitude[:, 1] ≈ fresh.bus_magnitude[:, 1] atol = 1e-8
+    @test _rv_q(data, bl, 2) ≈ _rv_q(fresh, fbl, 2) atol = 1e-8
+end
+
+@testset "remote voltage control: in place, refresh, islands, snapshot and restore (GAP-015)" begin
+    sys = _rv_system(; units = _RV_AB)
+    data = PowerFlowData(ACPolarPowerFlow(), sys)
+    bl = PF.get_bus_lookup(data)
+    s0 = PF.remote_voltage_snapshot(data)
+    # Refresh: the plant at 4's RMPCT edited in the System.
+    g4 = only(get_components(x -> get_number(get_bus(x)) == 4, ThermalStandard, sys))
+    get_ext(g4)["RMPCT"] = 20.0
+    @test PF.remote_voltage_refresh!(data, sys, bl[4]) == :sharing
+    @test solve_power_flow!(data)
+    @test _rv_q(data, bl, 2) / _rv_q(data, bl, 4) ≈ 3.0 rtol = 1e-9
+    @test PF.remote_voltage_refresh!(data, sys, bl[5]) == :none
+    @test PF.remote_voltage_refresh!(data, sys, bl[3]) == :refreshed     # X's q_base
+    # A plant with no unit left is released by the refresh.
+    set_available!(g4, false)
+    @test PF.remote_voltage_refresh!(data, sys, bl[4]) == :sharing
+    @test PF.get_remote_voltage_status(data)[3][2][3] == PF.RV_RELEASED
+    # Restore: everything back, and the solve is the base one.
+    PF.restore_remote_voltage!(data, s0)
+    set_available!(g4, true)
+    get_ext(g4)["RMPCT"] = 40.0
+    base, _ = _rv_solve(; units = _RV_AB)
+    data.bus_reactive_power_injections[:, 1] .= base.bus_reactive_power_injections[:, 1]
+    @test PF.is_remote_voltage_bus(data, bl[4])
+    @test all(s == 0 for (_, _, s) in PF.get_remote_voltage_status(data)[3])
+    @test solve_power_flow!(data)
+    @test data.bus_magnitude[:, 1] ≈ base.bus_magnitude[:, 1] atol = 1e-9
+    # A member fixed in one contingency does not start the next one fixed.
+    capped = [merge(_RV_AB[1], (qmax = 0.1,)), _RV_AB[2]]
+    data, bl = _rv_solve(; units = capped, q = true)
+    s1 = PF.remote_voltage_snapshot(data)
+    data.remote_voltage_control.status[1, 1] = 0
+    data.remote_voltage_control.returns[(1, 1)] = 2
+    PF.restore_remote_voltage!(data, s1)
+    @test data.remote_voltage_control.status[1, 1] == 1
+    @test isempty(data.remote_voltage_control.returns)
+    # Islands: a plant in another island than X is released holding its terminal; X dead (or a
+    # new swing) dissolves the group, live plants holding their terminals.
+    data, bl = _rv_solve(; units = _RV_AB)
+    n = length(bl)
+    island = ones(Int, n)
+    island[bl[4]] = 2
+    @test PF.remote_voltage_islands!(data, island, falses(n)) == 1
+    @test data.bus_type[bl[4], 1] == ACBusTypes.PV && !PF.is_remote_voltage_bus(data, bl[4])
+    @test data.bus_type[bl[3], 1] == ACBusTypes.PV                       # 2 still holds X
+    dead = falses(n)
+    dead[bl[3]] = true
+    @test PF.remote_voltage_islands!(data, ones(Int, n), dead) == 1
+    @test data.bus_type[bl[2], 1] == ACBusTypes.PV
+    @test isempty(filter(!iszero, data.remote_voltage_control.regulated_group))
+    data, bl = _rv_solve(; units = _RV_AB)
+    sw = falses(n)
+    sw[bl[2]] = true
+    @test PF.remote_voltage_islands!(data, ones(Int, n), falses(n); swing = sw) == 1
+    @test PF.get_remote_voltage_status(data)[3][1][3] == PF.RV_RELEASED
+end
+
+@testset "remote voltage control: a fast decoupled solve of data with groups is refused (GAP-015)" begin
+    data, _ = _rv_solve(; units = _RV_AB)
+    @test_throws ArgumentError PF._ac_power_flow(data, ACPolarPowerFlow{FastDecoupledXB}(), 1)
+    # Data without groups solves with it as before.
+    data = PowerFlowData(ACPolarPowerFlow(; remote_voltage_control = false), _rv_system())
+    @test PF._ac_power_flow(data, ACPolarPowerFlow{FastDecoupledXB}(), 1)
+end
+
+@testset "remote voltage control: a plant's RMPCT counts once, however many machines (GAP-015)" begin
+    # Two machines at bus 2, each carrying its plant's 20 %, beside a one-machine plant at bus 4
+    # at 20 %: PSS/E splits the group's Q 1:1 between the plants, not 2:1.
+    u(bus) = (bus = bus, ireg = 3, rmpct = 20.0, qmin = -3.0, qmax = 3.0)
+    data, bl = _rv_solve(; units = [u(2), u(2), u(4)])
+    grp = only(PF.get_remote_voltage_groups(data))
+    @test grp.member_numbers == [2, 4] && grp.shares == [20.0, 20.0]
+    @test _rv_v(data, bl, 3) ≈ 1.02 atol = 1e-9
+    @test _rv_q(data, bl, 2) ≈ _rv_q(data, bl, 4) rtol = 1e-9
+    # Machines at one bus that disagree: the largest, with a warning.
+    sys = _rv_system(; units = [merge(u(2), (rmpct = 30.0,)), u(2), u(4)])
+    data = @test_logs (:warn, r"different RMPCT") match_mode = :any PowerFlowData(
+        ACPolarPowerFlow(), sys)
+    @test only(PF.get_remote_voltage_groups(data)).shares == [30.0, 20.0]
+    # The share re-read in place counts once too.
+    sys = _rv_system(; units = [u(2), u(2), u(4)])
+    data = PowerFlowData(ACPolarPowerFlow(), sys)
+    bl = PF.get_bus_lookup(data)
+    PF.remote_voltage_refresh!(data, sys, bl[2])
+    @test only(PF.get_remote_voltage_groups(data)).shares == [20.0, 20.0]
+end
