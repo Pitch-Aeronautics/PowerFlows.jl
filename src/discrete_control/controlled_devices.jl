@@ -13,7 +13,14 @@ series impedance by the table's factor at the build-time tap. `correction` holds
 on, and the Y-bus re-stamped with, the corrected impedance at the new tap (see
 [`_series_admittance`](@ref)). A `PHASE_SHIFT_ANGLE`-mode table does not depend on the tap
 (the angle of a `TapTransformer` is its fixed winding-group shift): its factor is folded into
-`yt` at enrollment and `correction` is `nothing`."""
+`yt` at enrollment and `correction` is `nothing`.
+
+Voltage band (PSS/E `[VMI1, VMA1]`): when `band` is set the tap is held while its regulated
+voltage lies in `[v_lo, v_hi]`, and one outside the band regulates toward the violated edge
+and stops at the first discrete step inside it (see `_update_band_state!`, `snap_to_discrete`
+and `_band_settle!`). `side` is the latched violation (−1 below `v_lo`, +1 above `v_hi`, 0 not
+regulating) and `anchor` the tap where it latched; both are continuation scratch, reset at the
+start of every `_control_continuation!`. Without a band the tap is driven to `vset`."""
 mutable struct ControlledTap <: AbstractBranchControl
     name::String
     from_ix::Int
@@ -30,15 +37,20 @@ mutable struct ControlledTap <: AbstractBranchControl
     synced::Float64                  # tap reflected in the arc-admittance rows
     current::Float64
     correction::Union{Nothing, IS.PiecewiseLinearData}   # TAP_RATIO table, or nothing
+    band::Bool                       # hold inside [v_lo, v_hi] (PSS/E); false ⇒ drive to vset
+    v_lo::Float64                    # VMI1
+    v_hi::Float64                    # VMA1
+    side::Int                        # latched violation: −1 below, +1 above, 0 none
+    anchor::Float64                  # tap where the current latch began
 end
 
-# The pre-correction positional form (no impedance correction table).
+# Positional forms without the newer fields: no impedance correction table, point setpoint.
 ControlledTap(
     name, from_ix, to_ix, controlled_ix, vset, yt, alpha, p_min, p_max, levels, nz_offsets,
-    initial, synced, current,
+    initial, synced, current, correction = nothing,
 ) = ControlledTap(
     name, from_ix, to_ix, controlled_ix, vset, yt, alpha, p_min, p_max, levels, nz_offsets,
-    initial, synced, current, nothing,
+    initial, synced, current, correction, false, vset, vset, 0, current,
 )
 
 """Slope of PNM's correction-table interpolation (`PNM._interpolate_correction_factor`) at
@@ -310,6 +322,13 @@ stored_parameter_limits(set::ControlledDeviceSet, ::ControlledFACTS, i::Int, ts:
     (-set.facts_b_lim[i, ts], set.facts_b_lim[i, ts])
 
 voltage_setpoint(d::AbstractControlledDevice) = d.vset
+# A banded tap regulates toward the edge it latched on; otherwise toward `vset`.
+function control_setpoint(d::ControlledTap)
+    d.band || return d.vset
+    d.side < 0 && return d.v_lo
+    d.side > 0 && return d.v_hi
+    return d.vset
+end
 parameter_limits(d::ControlledTap) = (d.p_min, d.p_max)
 parameter_limits(d::ControlledSwitchedShunt) = (d.b_min, d.b_max)
 parameter_limits(d::ControlledFACTS) = (-d.b_lim, d.b_lim)
@@ -329,9 +348,48 @@ stamp_control!(d::AbstractControlledDevice, args...) =
 
 # PSS/E deadband semantics: a switched shunt is held while the controlled voltage is
 # anywhere INSIDE [VSWLO, VSWHI]; only excursions outside the band trigger switching.
-# Other device families carry a point setpoint (no parsed band) and always regulate.
+# A banded tap is held inside [VMI1, VMA1] unless it is already regulating toward an edge
+# (see `_update_band_state!`). FACTS devices carry a point setpoint and always regulate.
 _in_deadband(::AbstractControlledDevice, ::Float64) = false
 _in_deadband(d::ControlledSwitchedShunt, y::Float64) = d.vset_lo <= y <= d.vset_hi
+_in_deadband(d::ControlledTap, y::Float64) = d.band && d.side == 0 && d.v_lo <= y <= d.v_hi
+
+# Banded-tap latch, updated from the measured regulated voltage `y` before each damped move.
+# Below the band ⇒ latch −1 (regulate up to VMI1), above ⇒ +1 (down to VMA1), recording the tap
+# as `anchor`. A latched tap keeps regulating to its edge after crossing into the band, so the
+# continuation settles at the edge and the snap can take the first step inside (PSS/E stops at
+# the first tap position whose voltage is in the band). It is released, and held from then on,
+# when its voltage is inside the band while it still sits at its anchor: the band was reached
+# without it (other devices moved the voltage), or `_band_clamp` stopped its retreat there.
+_update_band_state!(::AbstractControlledDevice, ::Float64) = nothing
+function _update_band_state!(d::ControlledTap, y::Float64)
+    d.band || return
+    if y < d.v_lo
+        d.side == -1 || (d.side = -1; d.anchor = d.current)
+    elseif y > d.v_hi
+        d.side == 1 || (d.side = 1; d.anchor = d.current)
+    elseif d.side != 0 && abs(d.current - d.anchor) < _param_tol(d)
+        d.side = 0
+    end
+    return
+end
+
+# A latched tap never retreats past its anchor: the edge it regulates to is approached from
+# outside the band, so moving back beyond where it latched would leave the band on the other
+# side of a position at which the voltage was already outside. `dvdp` orients the move.
+_band_clamp(::AbstractControlledDevice, p::Float64, ::Float64) = p
+function _band_clamp(d::ControlledTap, p::Float64, dvdp::Float64)
+    (d.band && d.side != 0 && !iszero(dvdp)) || return p
+    # Sign of the tap movement that moves the voltage from the violated side into the band.
+    if -d.side * sign(dvdp) > 0
+        return max(p, d.anchor)
+    end
+    return min(p, d.anchor)
+end
+
+# A frozen device holds its parameter; a frozen tap is not regulating toward an edge.
+_release_band!(::AbstractControlledDevice) = nothing
+_release_band!(d::ControlledTap) = (d.side = 0; nothing)
 
 function _nz_index(A::SparseArrays.SparseMatrixCSC, row::Int, col::Int)
     @inbounds for k in SparseArrays.nzrange(A, col)
@@ -387,13 +445,62 @@ end
     return (hi - lo) / (1.0 + exp(S * (x - xset))) + lo
 end
 
+# Nearest discrete tap, except for a banded tap regulating toward an edge: the continuation left
+# it at the tap that puts its voltage on the edge, so the snap goes on in the direction it moved
+# (away from `anchor`) to the first level at or beyond it, the first position inside the band.
 function snap_to_discrete(d::ControlledTap, p::Float64)
     pc = clamp(p, d.p_min, d.p_max)
+    dir = 0
+    if d.band && d.side != 0
+        dir = Int(sign(pc - d.anchor))
+    end
+    if dir != 0
+        return _directional_level(d, pc, dir)
+    end
     best = d.levels[1]
     @inbounds for lv in d.levels
         abs(lv - pc) < abs(best - pc) && (best = lv)
     end
     return best
+end
+
+# The first level at or beyond `p` in direction `dir` (+1 up, −1 down), within a hair of `p`;
+# the end level when none lies beyond (the tap limits hold).
+function _directional_level(d::ControlledTap, p::Float64, dir::Int)
+    eps = 1e-9 * (d.p_max - d.p_min)
+    if dir > 0
+        @inbounds for lv in d.levels
+            lv >= p - eps && return lv
+        end
+        return d.levels[end]
+    end
+    @inbounds for k in length(d.levels):-1:1
+        d.levels[k] <= p + eps && return d.levels[k]
+    end
+    return d.levels[1]
+end
+
+# The next level strictly beyond the tap's current level in direction `dir`, or `nothing` at a
+# tap limit.
+function _next_level(d::ControlledTap, dir::Int)
+    eps = 1e-9 * (d.p_max - d.p_min)
+    if dir > 0
+        @inbounds for lv in d.levels
+            lv > d.current + eps && return lv
+        end
+    else
+        @inbounds for k in length(d.levels):-1:1
+            d.levels[k] < d.current - eps && return d.levels[k]
+        end
+    end
+    return nothing
+end
+
+# Whether a banded tap's regulated voltage `y` is still outside its band on the side it latched.
+function _outside_latched_side(d::ControlledTap, y::Float64)
+    d.side < 0 && return y < d.v_lo - CONTROL_TAP_BAND_TOL
+    d.side > 0 && return y > d.v_hi + CONTROL_TAP_BAND_TOL
+    return false
 end
 
 # PSS/E mixed banks: capacitor blocks (dB>0) switch on cumulatively in listed order,

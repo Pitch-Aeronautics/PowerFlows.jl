@@ -359,6 +359,11 @@ with the specified solver type.
     Default is `false`.
 - `control_discrete_devices::Bool`: Whether to run discrete device control (tap changers, switched
     shunts) via λ-continuation. Default is `false`.
+- `tap_voltage_band::Bool`: With `control_discrete_devices`, hold a voltage-controlling tap
+    whose regulated voltage lies inside its PSS/E band `[VMI1, VMA1]` and step one outside it
+    toward the band, stopping at the first tap position inside (PSS/E). `false` drives every
+    tap to its `voltage_setpoint` (the band midpoint for parsed data) with no deadband. Taps
+    without a parsed band always regulate to `voltage_setpoint`. Default is `true`.
 - `area_interchange_control::Bool`: Whether to embed PSS/E-style per-area net-interchange
     control in the AC solve (polar formulation; NR/TR/LM/FastDecoupled solvers).
     Default is `false`.
@@ -390,6 +395,7 @@ struct ACPolarPowerFlow{ACSolver <: ACPowerFlowSolverType} <: AbstractACPowerFlo
     time_step_names::Vector{String}
     correct_bustypes::Bool
     control_discrete_devices::Bool
+    tap_voltage_band::Bool
     area_interchange_control::Bool
     interchange_tolerance::Float64
     tie_definition::Symbol
@@ -449,6 +455,7 @@ function ACPolarPowerFlow{ACSolver}(;
     time_step_names::Vector{String} = String[],
     correct_bustypes::Bool = false,
     control_discrete_devices::Bool = false,
+    tap_voltage_band::Bool = true,
     area_interchange_control::Bool = false,
     interchange_tolerance::Float64 = DEFAULT_INTERCHANGE_TOLERANCE,
     tie_definition::Symbol = :lines_only,
@@ -486,6 +493,7 @@ function ACPolarPowerFlow{ACSolver}(;
         time_step_names,
         correct_bustypes,
         control_discrete_devices,
+        tap_voltage_band,
         area_interchange_control,
         validated_interchange_tolerance,
         tie_definition,
@@ -527,6 +535,8 @@ get_log_solver_diagnostics(pf::AbstractACPowerFlow) = pf.log_solver_diagnostics
 
 get_control_discrete_devices(pf::AbstractACPowerFlow) = pf.control_discrete_devices
 get_control_discrete_devices(::PowerFlowEvaluationModel) = false
+get_tap_voltage_band(pf::AbstractACPowerFlow) = pf.tap_voltage_band
+get_tap_voltage_band(::PowerFlowEvaluationModel) = true
 
 get_area_interchange_control(pf::AbstractACPowerFlow) = pf.area_interchange_control
 get_area_interchange_control(::PowerFlowEvaluationModel) = false
@@ -571,6 +581,11 @@ polar state layout and have no current-injection equivalent.
 - `correct_bustypes::Bool`: Default `false`.
 - `control_discrete_devices::Bool`: Whether to run discrete device control via λ-continuation.
     Default `false`.
+- `tap_voltage_band::Bool`: With `control_discrete_devices`, hold a voltage-controlling tap
+    whose regulated voltage lies inside its PSS/E band `[VMI1, VMA1]` and step one outside it
+    toward the band, stopping at the first tap position inside (PSS/E). `false` drives every
+    tap to its `voltage_setpoint` (the band midpoint for parsed data) with no deadband. Taps
+    without a parsed band always regulate to `voltage_setpoint`. Default `true`.
 - `area_interchange_control::Bool`: Not supported on this formulation (area interchange control is polar-only);
     passing `true` throws `ArgumentError`. Default `false`.
 - `solver_settings::Dict{Symbol, Any}`: Default empty.
@@ -593,6 +608,7 @@ struct ACRectangularPowerFlow{ACSolver <: ACPowerFlowSolverType} <:
     time_step_names::Vector{String}
     correct_bustypes::Bool
     control_discrete_devices::Bool
+    tap_voltage_band::Bool
     area_interchange_control::Bool
     interchange_tolerance::Float64
     tie_definition::Symbol
@@ -616,6 +632,7 @@ function ACRectangularPowerFlow{ACSolver}(;
     time_step_names::Vector{String} = String[],
     correct_bustypes::Bool = false,
     control_discrete_devices::Bool = false,
+    tap_voltage_band::Bool = true,
     area_interchange_control::Bool = false,
     interchange_tolerance::Float64 = DEFAULT_INTERCHANGE_TOLERANCE,
     tie_definition::Symbol = :lines_only,
@@ -659,6 +676,7 @@ function ACRectangularPowerFlow{ACSolver}(;
         time_step_names,
         correct_bustypes,
         control_discrete_devices,
+        tap_voltage_band,
         area_interchange_control,
         interchange_tolerance,
         tie_definition,
@@ -705,6 +723,11 @@ polar state layout and have no mixed current-power equivalent.
 - `correct_bustypes::Bool`: Default `false`.
 - `control_discrete_devices::Bool`: Whether to run discrete device control via λ-continuation.
     Default `false`.
+- `tap_voltage_band::Bool`: With `control_discrete_devices`, hold a voltage-controlling tap
+    whose regulated voltage lies inside its PSS/E band `[VMI1, VMA1]` and step one outside it
+    toward the band, stopping at the first tap position inside (PSS/E). `false` drives every
+    tap to its `voltage_setpoint` (the band midpoint for parsed data) with no deadband. Taps
+    without a parsed band always regulate to `voltage_setpoint`. Default `true`.
 - `area_interchange_control::Bool`: Not supported on this formulation (area interchange control is polar-only);
     passing `true` throws `ArgumentError`. Default `false`.
 - `solver_settings::Dict{Symbol, Any}`: Default empty.
@@ -727,6 +750,7 @@ struct ACMixedPowerFlow{ACSolver <: ACPowerFlowSolverType} <:
     time_step_names::Vector{String}
     correct_bustypes::Bool
     control_discrete_devices::Bool
+    tap_voltage_band::Bool
     area_interchange_control::Bool
     interchange_tolerance::Float64
     tie_definition::Symbol
@@ -750,6 +774,7 @@ function ACMixedPowerFlow{ACSolver}(;
     time_step_names::Vector{String} = String[],
     correct_bustypes::Bool = false,
     control_discrete_devices::Bool = false,
+    tap_voltage_band::Bool = true,
     area_interchange_control::Bool = false,
     interchange_tolerance::Float64 = DEFAULT_INTERCHANGE_TOLERANCE,
     tie_definition::Symbol = :lines_only,
@@ -791,6 +816,7 @@ function ACMixedPowerFlow{ACSolver}(;
         time_step_names,
         correct_bustypes,
         control_discrete_devices,
+        tap_voltage_band,
         area_interchange_control,
         interchange_tolerance,
         tie_definition,

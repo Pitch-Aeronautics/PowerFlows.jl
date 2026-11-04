@@ -167,6 +167,23 @@ function _shunt_susceptance_model(
     return b_fixed, current, b_min, b_max
 end
 
+"""The PSS/E controlled-voltage band `[VMI1, VMA1]` of a parsed `TapTransformer`, or `nothing`.
+
+PowerSystems 5 keeps the band only in `ext` (the PSS/E parser's `VMI1`/`VMA1`) and stores its
+midpoint as `voltage_setpoint`. The band is used only while the two agree: an API-built
+transformer has no band, and a setpoint moved off the midpoint after parsing is a point
+setpoint the caller chose, which a stale `ext` band must not override."""
+function _tap_voltage_band(tx, vset::Float64)
+    ext = PSY.get_ext(tx)
+    vmi = get(ext, "VMI1", nothing)
+    vma = get(ext, "VMA1", nothing)
+    (vmi isa Real && vma isa Real) || return nothing
+    vmi, vma = Float64(vmi), Float64(vma)
+    vmi < vma || return nothing
+    isapprox(vset, (vmi + vma) / 2; atol = 1e-9) || return nothing
+    return (vmi, vma)
+end
+
 """Build the type-stable device set from a `PSY.System`.
 
 `bus_lookup` maps PSY bus number → network index in the (possibly reduced) network;
@@ -176,13 +193,20 @@ sizes the returned set's per-ts shunt/FACTS state store (see `ControlledDeviceSe
 
 Per-device data problems (unresolvable buses, degenerate ranges, unsupported control
 modes) de-enroll the device with a `@warn` — the device stays at its current setting
-(a warn-and-lock posture) — and never abort construction."""
+(a warn-and-lock posture) — and never abort construction.
+
+`tap_voltage_band = true` (the default) gives a PSS/E-parsed voltage-controlling tap its
+`[VMI1, VMA1]` band: held while the regulated voltage is inside it, stepped toward it only when
+outside, stopping at the first discrete step inside (see `_tap_voltage_band`). `false` drives
+every tap to its `voltage_setpoint` (the band midpoint for parsed data), the behaviour before
+the band was implemented. Taps without a band always regulate to `voltage_setpoint`."""
 function build_controlled_device_set(
     sys,
     bus_lookup::Dict{Int, Int},
     ybus;
     reverse_bus_search_map::Dict{Int, Int} = Dict{Int, Int}(),
     n_time_steps::Int = 1,
+    tap_voltage_band::Bool = true,
 )
     taps = ControlledTap[]
     correction_tables = _tap_correction_tables(sys)
@@ -219,6 +243,8 @@ function build_controlled_device_set(
         _validate_tap(name, md.pmin, md.pmax, md.ntp) || continue
         _validate_vset("ControlledTap", name, md.vset) || continue
         yt, correction = _tap_series_admittance(tx, correction_tables)
+        band = tap_voltage_band ? _tap_voltage_band(tx, md.vset) : nothing
+        v_lo, v_hi = isnothing(band) ? (md.vset, md.vset) : band
         tap0 = PSY.get_tap(tx)
         if !(md.pmin - BOUNDS_TOLERANCE <= tap0 <= md.pmax + BOUNDS_TOLERANCE)
             @warn "ControlledTap \"$name\": initial tap ratio $tap0 lies \
@@ -244,6 +270,11 @@ function build_controlled_device_set(
                 tap0,   # synced (arc-admittance rows reflect this tap)
                 tap0,   # current
                 correction,
+                !isnothing(band),
+                v_lo,
+                v_hi,
+                0,      # side (continuation scratch)
+                tap0,   # anchor (continuation scratch)
             ),
         )
     end

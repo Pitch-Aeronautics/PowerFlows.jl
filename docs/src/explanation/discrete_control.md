@@ -203,8 +203,22 @@ trajectory — it is a safeguard, not an unconditional convergence proof.
 
 **Deadband.** A switched shunt whose controlled voltage is anywhere inside its
 parsed `[VSWLO, VSWHI]` band is held, not driven toward the band midpoint —
-the PSS/E semantics. Other device families carry a point setpoint (the parser
-persists no band for them) and always regulate.
+the PSS/E semantics. A voltage-controlling tap parsed from PSS/E keeps its
+`[VMI1, VMA1]` band (`ext`, while `voltage_setpoint` is still its midpoint): it
+is held while its regulated voltage (local or remote) lies inside the band; one
+outside latches the violated edge, regulates toward it, and the snap then takes
+the first discrete tap position inside the band, stepping one more position
+while the voltage is still outside (the tap limits hold). `tap_voltage_band =
+false` on the power flow restores the earlier behaviour, driving every tap to
+`voltage_setpoint` with no deadband. FACTS devices, and taps without a parsed
+band, carry a point setpoint and always regulate.
+
+**Impedance correction.** A tap transformer with a `TAP_RATIO` impedance
+correction table (`PSY.ImpedanceCorrectionData`) re-evaluates the table's
+factor at every tap the controller applies, so each step is sized on, and the
+Y-bus re-stamped with, the corrected impedance at the new tap (PNM's `Ybus`
+evaluates it at the build-time tap). Reported branch flows use the same
+corrected block at the solved tap.
 
 **Incremental applicator.** `_continuation_to!` tries the full damped move
 first — in the common case one warm-started inner solve accepts it. Only when
@@ -298,6 +312,7 @@ Only transformers with `get_control_objective(tx) == VOLTAGE` are included.
 | Tap ratio max    | `RMA1`, `RMA`                        | `tap_limits.max`                          | `1.1`              |
 | Tap positions    | `NTP1`, `NTP`                        | `number_of_tap_positions`                 | `33`               |
 | Voltage setpoint | `VSET` (never written by the parser) | `voltage_setpoint`                        | `1.0`              |
+| Voltage band     | `VMI1`, `VMA1` (PSS/E parser)        | (none on PSY 5.x)                         | no band            |
 
 Precedence: a nonzero `regulated_bus_number` wins for the controlled bus;
 for the numeric parameters the `ext` keys win over the first-class fields

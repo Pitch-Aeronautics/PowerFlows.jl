@@ -28,6 +28,9 @@ const INITIAL_CONTROL_STEEPNESS = 1.0e2   # paper eq.10: start (S−λ_S)≈100
 const MAX_CONTROL_STEEPNESS = 5.0e3       # paper: full S≈5000
 const CONTROL_STEEPNESS_GROWTH = 2.0
 const CONTROL_OSCILLATION_LIMIT = 3
+# A banded tap's regulated voltage counts as inside [VMI1, VMA1] within this margin (p.u.), so
+# a tap the continuation left exactly on an edge is not stepped on solver noise.
+const CONTROL_TAP_BAND_TOL = 1e-6
 # Post-solve saturation classification band for a continuous FACTS device: |V−vset| within
 # this is "at setpoint". A device pinned at its V-dependent susceptance bound with |V−vset|
 # above this is reported saturated (the homotopy analogue of a PV→PQ Q-limit release). Matches

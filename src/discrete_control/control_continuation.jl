@@ -417,6 +417,7 @@ end
 # settled so it cannot stall the steepness ramp for healthy devices, and is reported.
 function _freeze_device!(frozen::Vector{Bool}, idx::Int, d, ts::Int, reason::String)
     frozen[idx] = true
+    _release_band!(d)
     @warn "discrete control: freezing device $(d.name) at parameter \
         $(current_parameter(d)) (time step $ts): $reason"
     return
@@ -454,6 +455,7 @@ function _damped_target!(
 )
     yc = measured_value(d, data, ts)
     p_now = current_parameter(d)
+    _update_band_state!(d, yc)
     if _in_deadband(d, yc)
         # PSS/E deadband semantics: a device whose regulated quantity is inside its
         # band is held, not driven to the band midpoint.
@@ -484,7 +486,7 @@ function _damped_target!(
         end
     end
     prev_sign[idx] = s
-    return clamp(p_now + ω * (p_tgt - p_now), lo, hi), yc, true
+    return _band_clamp(d, clamp(p_now + ω * (p_tgt - p_now), lo, hi), dv), yc, true
 end
 
 # Freeze on a detected plant-gain sign reversal (OLTC reverse action) or a collapse below the
@@ -689,6 +691,8 @@ function _batched_pass!(
     # authoritative pass: snapshot the per-device bookkeeping `_damped_target!` mutates
     # (oscillation counter, direction, freezes) and restore it on rollback.
     osc0, prev0, frozen0 = copy(osc), copy(prev_sign), copy(frozen)
+    side0 = Int[d.side for d in set.taps]
+    anchor0 = Float64[d.anchor for d in set.taps]
     off_facts = n_taps + n_shunts
     moved = _apply_targets_group!(set.taps, 0, data, ts, S, frozen, dVdp, osc, prev_sign,
         n_shared, p_prev, did_move)
@@ -713,6 +717,10 @@ function _batched_pass!(
     copyto!(osc, osc0)
     copyto!(prev_sign, prev0)
     copyto!(frozen, frozen0)
+    for (i, d) in enumerate(set.taps)
+        d.side = side0[i]
+        d.anchor = anchor0[i]
+    end
     return false, false          # joint solve or sensitivity refresh failed ⇒ run sequential path
 end
 
@@ -786,6 +794,10 @@ function _control_continuation!(
     set.numeric_refactors[] = 0
     converged = _ctrl_solve!(pf, data, ts; kwargs...)
     converged || return false
+    for d in set.taps
+        d.side = 0
+        d.anchor = d.current
+    end
 
     n_taps = length(set.taps)
     n_shunts = length(set.shunts)
@@ -965,6 +977,106 @@ function _restore_device_group!(
     return ok
 end
 
+# PSS/E's "first step inside the band" for banded taps, after the snap's converged solve. The
+# continuation leaves a latched tap with its voltage on the edge only to within the sigmoid
+# law's fixed-point offset (≲1e-3 p.u. at full steepness, the step is ~0.006 p.u.), and taps
+# couple, so the snapped position is checked on the solved network:
+# 1. forward: a tap still outside its band on the latched side steps one more level in the
+#    direction it moved, until inside or at a tap limit;
+# 2. back-off: a tap one level back toward its anchor that would still be inside steps back,
+#    so it stops at the first position inside rather than one beyond;
+# 3. forward again, for any voltage the back-off moved out through coupling.
+# Each round applies its steps together and solves once. A failed solve rolls the round back
+# and ends the walk at the last converged state, with a warning.
+function _band_settle!(
+    pf, data, set::ControlledDeviceSet, ts::Int, snap::ControlStateSnapshot; kwargs...,
+)
+    any(d -> d.band && d.side != 0, set.taps) || return
+    n = length(set.taps)
+    prev = zeros(n)
+    moved = fill(false, n)
+    rounds = maximum(d -> length(d.levels), set.taps)
+    _band_forward!(pf, data, set, ts, snap, prev, moved, rounds; kwargs...) || return
+    _band_back_off!(pf, data, set, ts, snap, prev, moved, rounds; kwargs...) || return
+    _band_forward!(pf, data, set, ts, snap, prev, moved, rounds; kwargs...)
+    return
+end
+
+_band_latched(d::ControlledTap) = d.band && d.side != 0
+_band_direction(d::ControlledTap) = Int(sign(d.current - d.anchor))
+
+function _band_round_failed!(data, set, ts, snap, prev, moved)
+    for (i, d) in enumerate(set.taps)
+        moved[i] && apply_parameter!(d, data, prev[i], ts)
+    end
+    _restore_state!(data, ts, snap)
+    @warn "discrete control: a banded tap's step toward the first position inside its \
+        voltage band did not converge; leaving the taps at their last converged positions \
+        (time step $ts)."
+    return false
+end
+
+function _band_forward!(pf, data, set, ts, snap, prev, moved, rounds; kwargs...)
+    for _ in 1:rounds
+        fill!(moved, false)
+        _capture_state!(snap, data, ts)
+        for (i, d) in enumerate(set.taps)
+            _band_latched(d) || continue
+            _outside_latched_side(d, measured_value(d, data, ts)) || continue
+            dir = _band_direction(d)
+            iszero(dir) && continue
+            nxt = _next_level(d, dir)
+            isnothing(nxt) && continue
+            prev[i] = d.current
+            apply_parameter!(d, data, nxt, ts)
+            moved[i] = true
+        end
+        any(moved) || return true
+        _ctrl_solve!(pf, data, ts; kwargs...) ||
+            return _band_round_failed!(data, set, ts, snap, prev, moved)
+    end
+    return true
+end
+
+function _band_back_off!(pf, data, set, ts, snap, prev, moved, rounds; kwargs...)
+    active = [_band_latched(d) && !iszero(_band_direction(d)) for d in set.taps]
+    for _ in 1:rounds
+        fill!(moved, false)
+        _capture_state!(snap, data, ts)
+        for (i, d) in enumerate(set.taps)
+            active[i] || continue
+            dir = _band_direction(d)
+            back = _next_level(d, -dir)
+            # Never back past the anchor: the tap latched there with its voltage outside.
+            if iszero(dir) || isnothing(back) ||
+               dir * (back - d.anchor) < -1e-9 * (d.p_max - d.p_min)
+                active[i] = false
+                continue
+            end
+            prev[i] = d.current
+            apply_parameter!(d, data, back, ts)
+            moved[i] = true
+        end
+        any(moved) || return true
+        _ctrl_solve!(pf, data, ts; kwargs...) ||
+            return _band_round_failed!(data, set, ts, snap, prev, moved)
+        # A tap whose voltage left the band on the step back was already at its first
+        # position inside: return it there and stop backing it off.
+        reverted = false
+        for (i, d) in enumerate(set.taps)
+            moved[i] || continue
+            _outside_latched_side(d, measured_value(d, data, ts)) || continue
+            apply_parameter!(d, data, prev[i], ts)
+            active[i] = false
+            reverted = true
+        end
+        if reverted && !_ctrl_solve!(pf, data, ts; kwargs...)
+            return _band_round_failed!(data, set, ts, snap, prev, moved)
+        end
+    end
+    return true
+end
+
 function snap_and_restore!(
     pf,
     data,
@@ -981,7 +1093,10 @@ function snap_and_restore!(
     cont_taps = _snap_device_group!(set.taps, data, ts)
     cont_shunts = _snap_device_group!(set.shunts, data, ts)
     cont_facts = _snap_device_group!(set.facts, data, ts)
-    _ctrl_solve!(pf, data, ts; kwargs...) && return true
+    if _ctrl_solve!(pf, data, ts; kwargs...)
+        _band_settle!(pf, data, set, ts, scratch_snap; kwargs...)
+        return true
+    end
     _restore_state!(data, ts, pre)
     ok = _restore_device_group!(set.taps, data, ts, cont_taps, pf, scratch_snap; kwargs...)
     ok &= _restore_device_group!(

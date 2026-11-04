@@ -1320,3 +1320,235 @@ end
     n_inner = PowerFlows.get_control_inner_solve_count(data)
     @test 0 < n_inner < 300
 end
+
+# ── PSS/E voltage band [VMI1, VMA1] for voltage-controlling taps ────────────────────────────
+# `_make_solvable_tap_shunt_system` puts bus 2 at |V| ≈ 0.97 with the tap at 1.0, and the tap
+# has full authority over it (lowering the tap raises |V₂|). `remote` adds a load bus 4 behind
+# bus 2 and regulates it instead (regulated_bus_number = 4).
+function _banded_tap_system(vmi, vma; remote::Bool = false, tap = 1.0)
+    sys = _make_solvable_tap_shunt_system()
+    tx = only(get_components(TapTransformer, sys))
+    if remote
+        b2 = get_bus(sys, 2)
+        b4 = _add_simple_bus!(sys, 4, ACBusTypes.PQ, 230, 1.0, 0.0)
+        _add_simple_line!(sys, b2, b4, 1e-2, 5e-2, 0.0)
+        _add_simple_load!(sys, b4, 0.2, 0.1)
+        set_regulated_bus_number!(tx, 4)
+    end
+    # What the PSS/E parser stores: the band in `ext`, its midpoint as the setpoint.
+    get_ext(tx)["VMI1"] = vmi
+    get_ext(tx)["VMA1"] = vma
+    set_voltage_setpoint!(tx, (vmi + vma) / 2)
+    set_tap!(tx, tap)
+    return sys, tx
+end
+
+function _solve_banded(vmi, vma; remote::Bool = false, tap_voltage_band::Bool = true)
+    sys, _ = _banded_tap_system(vmi, vma; remote = remote)
+    pf = ACPolarPowerFlow(;
+        control_discrete_devices = true, tap_voltage_band = tap_voltage_band)
+    data = PowerFlowData(pf, sys)
+    @test solve_power_flow!(data)
+    d = only(PF.get_controlled_devices(data).taps)
+    return d, data.bus_magnitude[d.controlled_ix, 1]
+end
+
+# |V| at the regulated bus with the tap fixed at `tap` (no control).
+function _v_at_fixed_tap(vmi, vma, tap; remote::Bool = false)
+    sys, _ = _banded_tap_system(vmi, vma; remote = remote, tap = tap)
+    data = PowerFlowData(ACPolarPowerFlow(), sys)
+    @test solve_power_flow!(data)
+    reg = remote ? 4 : 2
+    return data.bus_magnitude[PF.get_bus_lookup(data)[reg], 1]
+end
+
+@testset "tap band: enrollment reads [VMI1, VMA1] only while the setpoint is its midpoint" begin
+    sys, tx = _banded_tap_system(0.95, 1.05)
+    data = PowerFlowData(ACPolarPowerFlow(), sys)
+    bl = PF.get_bus_lookup(data)
+    d = only(PowerFlows.build_controlled_device_set(sys, bl, data.power_network_matrix).taps)
+    @test d.band
+    @test (d.v_lo, d.v_hi) == (0.95, 1.05)
+    @test d.vset ≈ 1.0
+    # Option off: the midpoint point setpoint.
+    d_mid = only(
+        PowerFlows.build_controlled_device_set(sys, bl, data.power_network_matrix;
+            tap_voltage_band = false).taps,
+    )
+    @test !d_mid.band
+    # A setpoint moved off the midpoint after parsing wins over the stale ext band.
+    set_voltage_setpoint!(tx, 1.03)
+    d_moved = only(
+        PowerFlows.build_controlled_device_set(sys, bl, data.power_network_matrix).taps)
+    @test !d_moved.band
+    @test d_moved.vset ≈ 1.03
+    # API-built taps (no ext band) keep their point setpoint.
+    sys_api = _make_solvable_tap_shunt_system()
+    data_api = PowerFlowData(ACPolarPowerFlow(), sys_api)
+    @test !only(
+        PowerFlows.build_controlled_device_set(sys_api, PF.get_bus_lookup(data_api),
+            data_api.power_network_matrix).taps,
+    ).band
+    # The pf option defaults to the band.
+    @test ACPolarPowerFlow().tap_voltage_band
+    @test ACRectangularPowerFlow().tap_voltage_band
+    @test ACMixedPowerFlow().tap_voltage_band
+    @test !ACPolarPowerFlow(; tap_voltage_band = false).tap_voltage_band
+end
+
+@testset "tap band: latch, deadband and directional snap (unit)" begin
+    levels = collect(range(0.9, 1.1; length = 33))
+    d = PowerFlows.ControlledTap("t", 1, 2, 2, 1.0, 1.0 / (0.01 + 0.1im), 0.0, 0.9, 1.1,
+        levels, (1, 1, 1, 1), 1.0, 1.0, 1.0, nothing, true, 0.97, 1.03, 0, 1.0)
+    @test PowerFlows._in_deadband(d, 1.0)
+    PowerFlows._update_band_state!(d, 1.0)
+    @test d.side == 0
+    PowerFlows._update_band_state!(d, 0.96)              # below VMI1: latch, regulate to it
+    @test d.side == -1
+    @test d.anchor == 1.0
+    @test PowerFlows.control_setpoint(d) == 0.97
+    @test !PowerFlows._in_deadband(d, 0.98)              # latched: inside does not hold
+    # The tap moved down (dV/dp < 0): it may not retreat above its anchor.
+    @test PowerFlows._band_clamp(d, 1.02, -1.0) == 1.0
+    @test PowerFlows._band_clamp(d, 0.98, -1.0) == 0.98
+    # Snap goes on in the direction moved: 0.9810 lies between levels 0.98125 and 0.975.
+    d.current = 0.981
+    @test PowerFlows.snap_to_discrete(d, 0.981) ≈ 0.975
+    @test PowerFlows.snap_to_discrete(d, 0.85) == 0.9     # tap limit holds
+    d.current = 0.975
+    @test PowerFlows._next_level(d, -1) ≈ 0.96875
+    d.current = 0.9
+    @test isnothing(PowerFlows._next_level(d, -1))
+    # Back at its anchor with the voltage inside: released and held.
+    d.current = 1.0
+    PowerFlows._update_band_state!(d, 0.99)
+    @test d.side == 0
+    @test PowerFlows._in_deadband(d, 0.99)
+    PowerFlows._update_band_state!(d, 1.04)               # above VMA1
+    @test d.side == 1
+    @test PowerFlows.control_setpoint(d) == 1.03
+    # A point-setpoint tap snaps to the nearest level and has no deadband.
+    p = PowerFlows.ControlledTap("p", 1, 2, 2, 1.0, 1.0 + 0im, 0.0, 0.9, 1.1, levels,
+        (1, 1, 1, 1), 1.0, 1.0, 1.0)
+    @test !p.band
+    @test !PowerFlows._in_deadband(p, 1.0)
+    @test PowerFlows.snap_to_discrete(p, 0.981) ≈ 0.98125
+end
+
+@testset "tap band: a tap whose voltage is inside its band does not move" begin
+    v0 = _v_at_fixed_tap(0.95, 1.05, 1.0)
+    @test 0.95 < v0 < 1.0                       # inside the band, below its midpoint
+    d, v = _solve_banded(0.95, 1.05)
+    @test d.current == d.initial == 1.0
+    @test v ≈ v0 atol = 1e-8
+    # The midpoint option still drives it to 1.0.
+    d_mid, v_mid = _solve_banded(0.95, 1.05; tap_voltage_band = false)
+    @test d_mid.current < 1.0
+    @test abs(v_mid - 1.0) < 0.01
+end
+
+@testset "tap band: below the band, steps toward it and stops at the first position inside" begin
+    vmi, vma = 0.99, 1.03
+    @test _v_at_fixed_tap(vmi, vma, 1.0) < vmi
+    d, v = _solve_banded(vmi, vma)
+    p = d.current
+    @test p in d.levels
+    @test p < d.initial                         # lowering the tap raises |V₂|
+    @test vmi - PowerFlows.CONTROL_TAP_BAND_TOL <= v <= vma
+    # The first step inside: one position back toward the initial tap is still below VMI1.
+    step = d.levels[2] - d.levels[1]
+    @test _v_at_fixed_tap(vmi, vma, p + step) < vmi
+    @test v ≈ _v_at_fixed_tap(vmi, vma, p) atol = 1e-8
+    # The midpoint option drives further, to |V| ≈ 1.01.
+    d_mid, v_mid = _solve_banded(vmi, vma; tap_voltage_band = false)
+    @test d_mid.current < p
+    @test abs(v_mid - 1.01) < 0.01
+end
+
+@testset "tap band: above the band, steps toward it and stops at the first position inside" begin
+    vmi, vma = 0.90, 0.95
+    @test _v_at_fixed_tap(vmi, vma, 1.0) > vma
+    d, v = _solve_banded(vmi, vma)
+    p = d.current
+    @test p in d.levels
+    @test p > d.initial
+    @test vmi <= v <= vma + PowerFlows.CONTROL_TAP_BAND_TOL
+    step = d.levels[2] - d.levels[1]
+    @test _v_at_fixed_tap(vmi, vma, p - step) > vma
+end
+
+@testset "tap band: an unreachable band leaves the tap at its limit" begin
+    vmi, vma = 1.12, 1.14
+    @test _v_at_fixed_tap(vmi, vma, 0.9) < vmi    # even the lowest tap cannot reach it
+    d, v = _solve_banded(vmi, vma)
+    @test d.current == d.p_min == 0.9
+    @test v < vmi
+    vmi, vma = 0.80, 0.82
+    @test _v_at_fixed_tap(vmi, vma, 1.1) > vma
+    d, v = _solve_banded(vmi, vma)
+    @test d.current == d.p_max == 1.1
+end
+
+@testset "tap band: a remote regulated bus is held to the band the same way" begin
+    vmi, vma = 0.97, 1.03
+    @test _v_at_fixed_tap(vmi, vma, 1.0; remote = true) < vmi
+    d, v = _solve_banded(vmi, vma; remote = true)
+    @test d.controlled_ix != d.to_ix
+    p = d.current
+    @test p < d.initial
+    @test vmi - PowerFlows.CONTROL_TAP_BAND_TOL <= v <= vma
+    step = d.levels[2] - d.levels[1]
+    @test _v_at_fixed_tap(vmi, vma, p + step; remote = true) < vmi
+    # Inside the band at the initial tap: held.
+    vmi, vma = 0.80, 1.20
+    d, _ = _solve_banded(vmi, vma; remote = true)
+    @test d.current == d.initial
+end
+
+# Several taps whose regulated buses already sit inside [0.92, 1.08] (|V| ≈ 0.96–0.98 at tap
+# 1.0): with the band nothing has to move and the continuation settles in its first pass of
+# every stage; with the midpoint rule every tap chases 1.0 and the passes do real work.
+function _multi_banded_system(n; vmi = 0.92, vma = 1.08)
+    sys = System(100.0)
+    b1 = _add_simple_bus!(sys, 1, ACBusTypes.REF, 230, 1.0, 0.0)
+    _add_simple_source!(sys, b1, 0.0, 0.0)
+    for k in 1:n
+        bk = _add_simple_bus!(sys, 10 + k, ACBusTypes.PQ, 230, 1.0, 0.0)
+        _add_simple_load!(sys, bk, 40.0, 20.0)   # MW, MVAr
+        tx = TapTransformer(; name = "t$k", available = true,
+            active_power_flow = 0.0, reactive_power_flow = 0.0,
+            arc = Arc(; from = b1, to = bk), r = 0.005, x = 0.06 + 0.02k,
+            primary_shunt = 0.0 + 0.0im, tap = 1.0, rating = 1.0, base_power = 100.0,
+            control_objective = PSY.TransformerControlObjective.VOLTAGE,
+            voltage_setpoint = (vmi + vma) / 2,
+            ext = Dict{String, Any}("VMI1" => vmi, "VMA1" => vma))
+        add_component!(sys, tx)
+        # Neighbouring feeders are tied, so the taps interact.
+        k > 1 && _add_simple_line!(sys, get_bus(sys, 10 + k - 1), bk, 0.01, 0.2, 0.0)
+    end
+    return sys
+end
+
+@testset "tap band: a multi-tap system inside its bands settles at once; the midpoint rule moves" begin
+    n = 6
+    function run(band)
+        pf = ACPolarPowerFlow(; control_discrete_devices = true, tap_voltage_band = band)
+        data = PowerFlowData(pf, _multi_banded_system(n))
+        @test solve_power_flow!(data)
+        set = PF.get_controlled_devices(data)
+        v = [data.bus_magnitude[d.controlled_ix, 1] for d in set.taps]
+        return data, set, v
+    end
+    data_b, set_b, v_b = run(true)
+    @test all(0.92 .<= v_b .<= 0.99)                 # inside the band, below its midpoint
+    @test all(d.current == d.initial for d in set_b.taps)
+    inner_band = PF.get_control_inner_solve_count(data_b)
+    data_m, set_m, v_m = run(false)
+    @test count(d -> d.current != d.initial, set_m.taps) == n
+    @test all(abs.(v_m .- 1.0) .< 0.01)
+    inner_mid = PF.get_control_inner_solve_count(data_m)
+    # Band: the base solve and the snap's solve, no pass moves anything (2 inner solves here);
+    # the midpoint rule ran 45.
+    @test inner_band <= 3
+    @test inner_mid > 10 * inner_band
+end
