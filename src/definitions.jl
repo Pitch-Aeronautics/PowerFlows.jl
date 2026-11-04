@@ -100,6 +100,14 @@ const IWAMOTO_MU_MIN = 0.0 # minimum step multiplier (zero permits "no step" whe
 const IWAMOTO_MU_MAX = 1.0 # maximum step multiplier
 const IWAMOTO_DEGENERACY_TOL = 1e-30 # near-zero tolerance for degenerate cubic/quadratic
 const IWAMOTO_MAX_REVERTS = 3 # consecutive reverted steps before early termination
+# Backtracking line search on the Newton step (`solver_settings[:line_search] = :backtracking`)
+const LINE_SEARCH_METHODS = (:none, :backtracking)
+const DEFAULT_LINE_SEARCH = :none # plain Newton (the full step, as before)
+const DEFAULT_LINE_SEARCH_C = 1e-4 # Armijo constant: accept α when ‖F(x+αΔx)‖₂ < (1 − c·α)‖F(x)‖₂
+const DEFAULT_LINE_SEARCH_SHRINK = 0.5 # α ← shrink·α after a rejected trial
+const DEFAULT_LINE_SEARCH_MIN_STEP = 1e-3 # once α ≤ this, the step is taken without the test
+const LINE_SEARCH_NORMS = (:balance, :full)
+const DEFAULT_LINE_SEARCH_NORM = :balance # polar: the P rows of PV/PQ buses and the Q rows of PQ buses
 # only used for trust region.
 const DEFAULT_TRUST_REGION_ETA = 1e-4 # if actual improvement/predicted improvement
 # is < eta, then reject the step Δx, shrink the trust region, and try again.

@@ -636,6 +636,176 @@ function _iwamoto_step(time_step::Int,
     return true
 end
 
+"""Settings of the backtracking line search on the Newton step
+(`solver_settings = Dict(:line_search => :backtracking)`, see [`NewtonRaphsonACPowerFlow`](@ref)):
+the Armijo constant `c`, the factor `shrink` applied to α after a rejected trial, the step
+`min_step` at or below which the step is taken without the test, and which residual rows the
+2-norm counts (`norm`, see [`_line_search_rows`](@ref))."""
+struct BacktrackingLineSearch
+    c::Float64
+    shrink::Float64
+    min_step::Float64
+    norm::Symbol
+end
+
+"""Per-solve tally of the backtracking line search, for the solver log: Newton steps taken,
+steps shortened (α < 1), rejected trials (step cuts) in all, steps taken at the minimum step
+without the Armijo test, and the smallest α taken."""
+mutable struct LineSearchTally
+    steps::Int
+    shortened::Int
+    cuts::Int
+    at_min_step::Int
+    min_α::Float64
+end
+LineSearchTally() = LineSearchTally(0, 0, 0, 0, 1.0)
+
+"""Check the line search settings and return a [`BacktrackingLineSearch`](@ref), or `nothing`
+for `line_search = :none`. Throws an `ArgumentError` for an unknown method, a parameter out of
+range, or `iwamoto = true` beside a line search (two step controls)."""
+function _line_search_settings(
+    line_search,
+    c::Real,
+    shrink::Real,
+    min_step::Real,
+    iwamoto::Bool,
+    norm::Symbol = DEFAULT_LINE_SEARCH_NORM,
+)::Union{Nothing, BacktrackingLineSearch}
+    line_search in LINE_SEARCH_METHODS || throw(
+        ArgumentError(
+            "line_search = $(repr(line_search)) is not one of $(LINE_SEARCH_METHODS)",
+        ),
+    )
+    line_search === :none && return nothing
+    iwamoto && throw(
+        ArgumentError(
+            "line_search = :backtracking and iwamoto = true are two step controls; " *
+            "set one of them",
+        ),
+    )
+    0.0 < c < 1.0 ||
+        throw(ArgumentError("line_search_c = $c must lie in (0, 1)"))
+    0.0 < shrink < 1.0 ||
+        throw(ArgumentError("line_search_shrink = $shrink must lie in (0, 1)"))
+    0.0 < min_step <= 1.0 ||
+        throw(ArgumentError("line_search_min_step = $min_step must lie in (0, 1]"))
+    norm in LINE_SEARCH_NORMS || throw(
+        ArgumentError("line_search_norm = $(repr(norm)) is not one of $(LINE_SEARCH_NORMS)"),
+    )
+    return BacktrackingLineSearch(Float64(c), Float64(shrink), Float64(min_step), norm)
+end
+
+"""The residual rows the line search's 2-norm counts, or `nothing` for every row.
+
+`norm = :balance` on the polar formulation counts the network balance equations a reduced
+Newton solves: the P row of every PV and PQ bus and the Q row of every PQ bus, plus every row
+past the buses' (LCC, VSC, area interchange). It leaves out the rows whose mismatch the state's
+own free injection absorbs, the REF buses' P and Q rows and the PV buses' Q rows, so the
+measure does not depend on how far a step moved the slack and generator Q states (it equals the
+‖F‖₂ of a solver whose state is |V| and θ only). A PV bus regulated by remote generators
+(GAP-015) keeps its Q row: its Q slot is the group's total, shared over member buses whose Q
+rows are network equations. Bus types are read at `time_step` when the solve starts (they do not
+change inside one Newton solve). `norm = :full`, and the rectangular and mixed formulations,
+count every row."""
+_line_search_rows(::Union{ACRectangularCIResidual, ACMixedCPBResidual}, ::Symbol, ::Int) =
+    nothing
+function _line_search_rows(residual::ACPowerFlowResidual, norm::Symbol, time_step::Int)
+    norm === :full && return nothing
+    data = residual.data
+    n = size(data.bus_type, 1)
+    regulated = data.remote_voltage_control.regulated_group
+    rows = Int[]
+    sizehint!(rows, length(residual.Rv))
+    @inbounds for ix in 1:n
+        bt = data.bus_type[ix, time_step]
+        if bt == PSY.ACBusTypes.PQ
+            push!(rows, 2 * ix - 1, 2 * ix)
+        elseif bt == PSY.ACBusTypes.PV
+            push!(rows, 2 * ix - 1)
+            (!isempty(regulated) && regulated[ix] != 0) && push!(rows, 2 * ix)
+        end
+    end
+    append!(rows, (2 * n + 1):length(residual.Rv))
+    return rows
+end
+
+"""The line search's measure: `‖F‖₂` over `rows` (`nothing`: every row)."""
+_line_search_norm(F::Vector{Float64}, ::Nothing) = norm(F, 2)
+function _line_search_norm(F::Vector{Float64}, rows::Vector{Int})
+    s = 0.0
+    @inbounds for r in rows
+        s += F[r]^2
+    end
+    return sqrt(s)
+end
+
+"""Does a single iteration of Newton-Raphson with a backtracking line search on the residual's
+2-norm (over `rows`, see [`_line_search_rows`](@ref)). The full Newton step is tried first (α = 1); while the trial residual is not finite or
+fails the Armijo test `‖F(x + αΔx)‖₂ < (1 − c·α)‖F(x)‖₂`, α is multiplied by `shrink`. Once
+α ≤ `min_step` the step `x + αΔx` is taken without the test, so the iteration always moves
+(the step is never reverted). Updates `x`, the residual and the Jacobian; returns α."""
+function _backtracking_step(time_step::Int,
+    stateVector::StateVectorCache,
+    linSolveCache::PFLinearSolverCache,
+    residual::Union{ACPowerFlowResidual, ACRectangularCIResidual, ACMixedCPBResidual},
+    J::Union{ACPowerFlowJacobian, ACRectangularCIJacobian, ACMixedCPBJacobian},
+    ls::BacktrackingLineSearch,
+    rows::Union{Nothing, Vector{Int}},
+    tally::LineSearchTally,
+    refinement_threshold::Float64 = DEFAULT_REFINEMENT_THRESHOLD,
+    refinement_eps::Float64 = DEFAULT_REFINEMENT_EPS,
+)::Float64
+    copyto!(stateVector.r, residual.Rv)
+    f0 = _line_search_norm(stateVector.r, rows)
+    _set_Δx_nr!(
+        stateVector,
+        J,
+        linSolveCache,
+        NewtonRaphsonACPowerFlow(),
+        refinement_threshold,
+        refinement_eps,
+    )
+    # Δx_proposed is the trust region's buffer, unused by Newton: it keeps the pre-step x so
+    # each trial is x₀ + αΔx exactly, not a running sum.
+    x_old = stateVector.Δx_proposed
+    copyto!(x_old, stateVector.x)
+    α = 1.0
+    cuts = 0
+    forced = false
+    while true
+        @. stateVector.x = x_old + α * stateVector.Δx_nr
+        residual(stateVector.x, time_step)
+        if α <= ls.min_step
+            forced = true
+            break
+        end
+        f_trial = _line_search_norm(residual.Rv, rows)
+        if isfinite(f_trial) && f_trial < (1.0 - ls.c * α) * f0
+            break
+        end
+        α *= ls.shrink
+        cuts += 1
+    end
+    tally.steps += 1
+    tally.cuts += cuts
+    α < 1.0 && (tally.shortened += 1)
+    forced && (tally.at_min_step += 1)
+    tally.min_α = min(tally.min_α, α)
+    @debug "Line search: α = $(siground(α)) after $cuts cut(s)" *
+           (forced ? " (minimum step, taken untested)" : "") *
+           ", ‖F‖₂ $(siground(f0)) → $(siground(_line_search_norm(residual.Rv, rows)))"
+    J(time_step)
+    return α
+end
+
+"""Log the line search's tally for one Newton solve."""
+function _report_line_search(tally::LineSearchTally, ls::BacktrackingLineSearch)
+    @info "Backtracking line search: $(tally.shortened) of $(tally.steps) Newton steps " *
+          "shortened ($(tally.cuts) step cuts), $(tally.at_min_step) at the minimum step " *
+          "$(ls.min_step); smallest α $(siground(tally.min_α))."
+    return
+end
+
 # Formulation-dispatched voltage-magnitude validation, driven entirely by the
 # per-formulation index list precomputed once on the residual. Polar indexes
 # the state as `[|V|, θ, …]` (`x[2i-1]` = |V|, PQ only); rectangular CI and
@@ -681,7 +851,15 @@ end
     improve the accuracy. Default: $DEFAULT_REFINEMENT_THRESHOLD.
 - `refinement_eps::Float64`: run iterative refinement on `J_x Δx = r` until
     `norm(Δx_{i}-Δx_{i+1}, 1)/norm(r,1) < refinement_eps`. Default:
-    $DEFAULT_REFINEMENT_EPS """
+    $DEFAULT_REFINEMENT_EPS
+- `iwamoto::Bool`: Iwamoto step control (see [`NewtonRaphsonACPowerFlow`](@ref)). Default: `false`.
+- `line_search::Symbol`: `:none` (the full Newton step) or `:backtracking` (see
+    `_backtracking_step`). Default: `$(repr(DEFAULT_LINE_SEARCH))`.
+- `line_search_c`, `line_search_shrink`, `line_search_min_step`: the line search's Armijo
+    constant, step factor and minimum step. Defaults: $DEFAULT_LINE_SEARCH_C,
+    $DEFAULT_LINE_SEARCH_SHRINK, $DEFAULT_LINE_SEARCH_MIN_STEP.
+- `line_search_norm::Symbol`: the rows the line search's 2-norm counts, `:balance` or `:full`
+    (see `_line_search_rows`). Default: `$(repr(DEFAULT_LINE_SEARCH_NORM))`. """
 function _run_power_flow_method(time_step::Int,
     stateVector::StateVectorCache,
     linSolveCache::PFLinearSolverCache,
@@ -695,15 +873,38 @@ function _run_power_flow_method(time_step::Int,
     validate_voltage_magnitudes::Bool = DEFAULT_VALIDATE_VOLTAGES,
     vm_validation_range::MinMax = DEFAULT_VALIDATION_RANGE,
     iwamoto::Bool = false,
+    line_search::Symbol = DEFAULT_LINE_SEARCH,
+    line_search_c::Real = DEFAULT_LINE_SEARCH_C,
+    line_search_shrink::Real = DEFAULT_LINE_SEARCH_SHRINK,
+    line_search_min_step::Real = DEFAULT_LINE_SEARCH_MIN_STEP,
+    line_search_norm::Symbol = DEFAULT_LINE_SEARCH_NORM,
     stop_at_fold::Bool = false,
     _ignored...,  # absorb unknown keys from caller without error
 )
     validate_vms = validate_voltage_magnitudes
+    ls = _line_search_settings(line_search, line_search_c, line_search_shrink,
+        line_search_min_step, iwamoto, line_search_norm)
+    rows = isnothing(ls) ? nothing : _line_search_rows(residual, ls.norm, time_step)
+    tally = LineSearchTally()
+    α = 1.0
     i, converged = 1, false
     consecutive_reverts = 0
     monitor, diag_state = setup_solver_diagnostics(J, stop_at_fold)
     while i < maxIterations && !converged
-        if iwamoto
+        if !isnothing(ls)
+            α = _backtracking_step(
+                time_step,
+                stateVector,
+                linSolveCache,
+                residual,
+                J,
+                ls,
+                rows,
+                tally,
+                refinement_threshold,
+                refinement_eps,
+            )
+        elseif iwamoto
             made_progress = _iwamoto_step(
                 time_step,
                 stateVector,
@@ -742,16 +943,26 @@ function _run_power_flow_method(time_step::Int,
         if !isnothing(diag_state)
             # After `_simple_step`, J.Jv and residual.Rv are at the same iterate, so
             # one refactor feeds both the log line and the bail-out.
-            run_solver_diagnostics!(
-                diag_state, "NR iter $i", residual, J, time_step,
-                linSolveCache, monitor, stop_at_fold) &&
+            label = isnothing(ls) ? "NR iter $i" : "NR iter $i (α = $(siground(α)))"
+            if run_solver_diagnostics!(
+                diag_state, label, residual, J, time_step,
+                linSolveCache, monitor, stop_at_fold)
+                isnothing(ls) || _report_line_search(tally, ls)
                 return false, i
+            end
         end
         converged = norm(residual.Rv, Inf) < tol
+        # A non-finite residual cannot recover (the line search's untested minimum step can
+        # land on one): stop, as the line search's reference does.
+        if !converged && !isnothing(ls) && !all(isfinite, residual.Rv)
+            @debug "Line search: the residual is not finite after step $i; stopping"
+            break
+        end
         if !converged
             i += 1
         end
     end
+    isnothing(ls) || _report_line_search(tally, ls)
     return converged, i
 end
 
@@ -1144,6 +1355,11 @@ function _newton_power_flow(
     refinement_threshold::Float64 = DEFAULT_REFINEMENT_THRESHOLD,
     refinement_eps::Float64 = DEFAULT_REFINEMENT_EPS,
     iwamoto::Bool = false,
+    line_search::Symbol = DEFAULT_LINE_SEARCH,
+    line_search_c::Real = DEFAULT_LINE_SEARCH_C,
+    line_search_shrink::Real = DEFAULT_LINE_SEARCH_SHRINK,
+    line_search_min_step::Real = DEFAULT_LINE_SEARCH_MIN_STEP,
+    line_search_norm::Symbol = DEFAULT_LINE_SEARCH_NORM,
     # TR-specific
     factor::Float64 = DEFAULT_TRUST_REGION_FACTOR,
     eta::Float64 = DEFAULT_TRUST_REGION_ETA,
@@ -1159,6 +1375,9 @@ function _newton_power_flow(
     linear_solver::Union{Nothing, AbstractString} = nothing,
     _ignored...,
 ) where {T <: Union{TrustRegionACPowerFlow, NewtonRaphsonACPowerFlow}}
+    if T === TrustRegionACPowerFlow && line_search !== :none
+        throw(ArgumentError("line_search applies to NewtonRaphsonACPowerFlow only"))
+    end
 
     # setup: common code
     init_kwargs = if isnothing(x0)
@@ -1197,6 +1416,11 @@ function _newton_power_flow(
             refinement_threshold,
             refinement_eps,
             iwamoto,
+            line_search,
+            line_search_c,
+            line_search_shrink,
+            line_search_min_step,
+            line_search_norm,
             factor,
             eta,
             autoscale,

@@ -140,6 +140,35 @@ function _validate_discrete_control_settings(
     return
 end
 
+# The backtracking line search (`solver_settings[:line_search]`) is a step control of
+# `NewtonRaphsonACPowerFlow` only. Checked at construction so a bad setting fails once, not at
+# every solve of a continuation; `_line_search_settings` checks the same at solve time for
+# settings passed as call kwargs. Centralized so the three formulation constructors cannot drift.
+function _validate_line_search_settings(
+    ::Type{ACSolver},
+    settings::AbstractDict,
+) where {ACSolver <: ACPowerFlowSolverType}
+    method = get(settings, :line_search, DEFAULT_LINE_SEARCH)
+    method === DEFAULT_LINE_SEARCH && return
+    if ACSolver !== NewtonRaphsonACPowerFlow
+        throw(
+            ArgumentError(
+                "solver_settings[:line_search] = $(repr(method)) requires " *
+                "NewtonRaphsonACPowerFlow; got $(ACSolver).",
+            ),
+        )
+    end
+    _line_search_settings(
+        method,
+        get(settings, :line_search_c, DEFAULT_LINE_SEARCH_C),
+        get(settings, :line_search_shrink, DEFAULT_LINE_SEARCH_SHRINK),
+        get(settings, :line_search_min_step, DEFAULT_LINE_SEARCH_MIN_STEP),
+        get(settings, :iwamoto, false),
+        get(settings, :line_search_norm, DEFAULT_LINE_SEARCH_NORM),
+    )
+    return
+end
+
 # Validated for NR/TR/LM/FastDecoupled: LM feeds the augmented rows through its
 # normal-equations residual; FDFixedJacobian carries the border in the frozen augmented
 # Jacobian; FDDecoupled corrects the tail via the bordered-Schur substep
@@ -223,6 +252,24 @@ poorly-initialized systems.
 
 Based on: Iwamoto & Tamura, "A Load Flow Calculation Method for Ill-Conditioned Power
 Systems," IEEE Trans. PAS, 1981.
+
+A backtracking line search can be enabled instead via
+`solver_settings = Dict(:line_search => :backtracking)`. Each iteration tries the full
+Newton step (α = 1) and, while the trial residual is not finite or
+`‖F(x + αΔx)‖₂ ≥ (1 − c·α)‖F(x)‖₂` (Armijo), multiplies α by `shrink`; once α falls to
+`min_step` the step is taken without the test, so every iteration moves. Settings:
+`:line_search_c` (default $DEFAULT_LINE_SEARCH_C), `:line_search_shrink` (default
+$DEFAULT_LINE_SEARCH_SHRINK), `:line_search_min_step` (default $DEFAULT_LINE_SEARCH_MIN_STEP),
+`:line_search_norm` (default `$(repr(DEFAULT_LINE_SEARCH_NORM))`: on the polar formulation the
+2-norm counts the P rows of PV and PQ buses and the Q rows of PQ buses, leaving out the rows a
+free injection state absorbs, the REF buses' P and Q and the PV buses' Q; `:full` counts every
+row, as the rectangular and mixed formulations always do).
+The solve stops when the residual is not finite. Each solve logs (`@info`) how many steps were
+shortened, how many trials were cut and how many steps were taken at the minimum step; each
+step's α is logged at `@debug`, and in `log_solver_diagnostics`' per-iteration line. The line
+search and `:iwamoto` cannot both be set. It applies to every formulation's Newton solve,
+including each solve of the discrete-control continuation. Default `:none`: the full step, as
+before.
 
 See also: [`ACPowerFlow`](@ref).
 """
@@ -534,6 +581,7 @@ function ACPolarPowerFlow{ACSolver}(;
     )
     _validate_discrete_control_settings(control_discrete_devices, ACSolver)
     _validate_tap_direction(tap_direction)
+    _validate_line_search_settings(ACSolver, solver_settings)
     validated_interchange_tolerance = _validate_area_interchange_settings(
         ACSolver,
         area_interchange_control,
@@ -753,6 +801,7 @@ function ACRectangularPowerFlow{ACSolver}(;
     )
     _validate_discrete_control_settings(control_discrete_devices, ACSolver)
     _validate_tap_direction(tap_direction)
+    _validate_line_search_settings(ACSolver, solver_settings)
     return ACRectangularPowerFlow{ACSolver}(
         check_reactive_power_limits,
         exporter,
@@ -911,6 +960,7 @@ function ACMixedPowerFlow{ACSolver}(;
     )
     _validate_discrete_control_settings(control_discrete_devices, ACSolver)
     _validate_tap_direction(tap_direction)
+    _validate_line_search_settings(ACSolver, solver_settings)
     return ACMixedPowerFlow{ACSolver}(
         check_reactive_power_limits,
         exporter,
