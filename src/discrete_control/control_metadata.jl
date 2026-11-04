@@ -366,6 +366,7 @@ function build_controlled_device_set(
                 tap0,   # anchor (continuation scratch)
                 tap_direction == :cont_sign ? _tap_cont_orientation(tx) : 0,
                 0,      # aligned (continuation scratch)
+                0.0,    # offset (continuation scratch)
             ),
         )
     end

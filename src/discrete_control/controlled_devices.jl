@@ -26,8 +26,10 @@ Orientation: the continuation orients a tap by its measured dV/dp. With `orienta
 (`tap_direction = :cont_sign`, from PSS/E's CONT1) the sign of dV/dp is fixed instead, as PSS/E
 adjusts the ratio: a regulated bus on the winding-2 (to) side, where raising the ratio lowers
 its voltage, is −1, one on the winding-1 (from) side +1. A terminal bus is on its own side; a
-remote bus is placed by CONT1's sign, > 0 the winding-2 side, < 0 the winding-1 side. The measured magnitude still sizes each step. `aligned` is set when parallel
-taps regulating one bus measure opposite signs (see `_align_parallel_taps!`)."""
+remote bus is placed by CONT1's sign, > 0 the winding-2 side, < 0 the winding-1 side. The
+measured magnitude still sizes each step. `aligned` is set when parallel taps regulating one
+bus measure opposite signs, and `offset` keeps a parallel unit's ratio offset from its group, so
+the units move by the same amount (see `_align_parallel_taps!`)."""
 mutable struct ControlledTap <: AbstractBranchControl
     name::String
     from_ix::Int
@@ -51,6 +53,7 @@ mutable struct ControlledTap <: AbstractBranchControl
     anchor::Float64                  # tap where the current latch began
     orientation::Int                 # sign of dV/dp fixed by PSS/E's CONT sign; 0 ⇒ measured
     aligned::Int                     # continuation scratch: sign a parallel group imposed
+    offset::Float64                  # continuation scratch: ratio offset within a parallel group
 end
 
 # Positional forms without the newer fields: no impedance correction table, point setpoint,
@@ -67,7 +70,7 @@ ControlledTap(
     initial, synced, current, correction, band, v_lo, v_hi, side, anchor,
 ) = ControlledTap(
     name, from_ix, to_ix, controlled_ix, vset, yt, alpha, p_min, p_max, levels, nz_offsets,
-    initial, synced, current, correction, band, v_lo, v_hi, side, anchor, 0, 0,
+    initial, synced, current, correction, band, v_lo, v_hi, side, anchor, 0, 0, 0.0,
 )
 
 """The sign of dV/dp the continuation must use for device `d`, or 0 to use the measured one:

@@ -191,3 +191,56 @@ end
         @test 1.04 - PowerFlows.CONTROL_TAP_BAND_TOL <= v_c <= 1.05
     end
 end
+
+"""S(2) ═ two parallel units T1, T2 (R→S, x = 0.05) ═ R(3), with S fed from REF(1) by a short
+line and a 300 MW / 100 MVAr load at R, which has no other connection. Both units regulate their
+own winding-1 bus R (CONT1 = 3, the from bus: raising either ratio raises |V_R|) and sit 15
+steps apart, T1 at 1.05 and T2 at 0.95625 (33 positions over [0.9, 1.1]), so a reactive current
+circulates between them. Band [`vmi`, `vma`]."""
+function _unequal_parallel_system(vmi, vma)
+    sys = System(100.0)
+    b1 = _add_simple_bus!(sys, 1, ACBusTypes.REF, 230, 1.0, 0.0)
+    _add_simple_source!(sys, b1, 0.0, 0.0)
+    bs = _add_simple_bus!(sys, 2, ACBusTypes.PQ, 230, 1.0, 0.0)
+    br = _add_simple_bus!(sys, 3, ACBusTypes.PQ, 115, 1.0, 0.0)
+    _add_simple_line!(sys, b1, bs, 0.002, 0.02, 0.0)
+    _add_simple_load!(sys, br, 300.0, 100.0)
+    for (nm, t) in (("T1", 1.05), ("T2", 0.95625))
+        add_component!(sys, TapTransformer(; name = nm, available = true,
+            active_power_flow = 0.0, reactive_power_flow = 0.0,
+            arc = Arc(; from = br, to = bs), r = 0.002, x = 0.05, primary_shunt = 0.0im,
+            tap = t, rating = 1.0, base_power = 100.0,
+            control_objective = PSY.TransformerControlObjective.VOLTAGE,
+            voltage_setpoint = (vmi + vma) / 2, regulated_bus_number = 3,
+            ext = Dict{String, Any}("VMI1" => vmi, "VMA1" => vma, "CONT1" => 3)))
+    end
+    return sys
+end
+
+function _solve_unequal_parallel(vmi, vma, direction)
+    pf = ACPolarPowerFlow(; control_discrete_devices = true, tap_direction = direction)
+    data = PowerFlowData(pf, _unequal_parallel_system(vmi, vma))
+    @test solve_power_flow!(data)
+    taps = Dict(d.name => d for d in PF.get_controlled_devices(data).taps)
+    return taps, data.bus_magnitude[PF.get_bus_lookup(data)[3], 1]
+end
+
+@testset "tap direction: parallel units at unequal ratios move by the same steps (GAP-058)" begin
+    base = PowerFlowData(ACPolarPowerFlow(), _unequal_parallel_system(0.5, 1.5))
+    @test solve_power_flow!(base)
+    v0 = base.bus_magnitude[PF.get_bus_lookup(base)[3], 1]
+    for (vmi, vma, dir) in ((v0 + 0.01, v0 + 0.03, 1), (v0 - 0.03, v0 - 0.01, -1)),
+        direction in (:sensitivity, :cont_sign)
+
+        taps, v = _solve_unequal_parallel(vmi, vma, direction)
+        t1, t2 = taps["T1"], taps["T2"]
+        step = t1.levels[2] - t1.levels[1]
+        n1 = round(Int, (t1.current - t1.initial) / step)
+        n2 = round(Int, (t2.current - t2.initial) / step)
+        @test t1.current in t1.levels && t2.current in t2.levels
+        @test n1 == n2                         # together, keeping the 15-step offset
+        @test sign(n1) == dir                  # in the direction that corrects |V_R|
+        @test vmi - PowerFlows.CONTROL_TAP_BAND_TOL <= v <= vma + PowerFlows.CONTROL_TAP_BAND_TOL
+        @test t1.offset ≈ (1.05 - 0.95625) / 2 && t2.offset ≈ -(1.05 - 0.95625) / 2
+    end
+end

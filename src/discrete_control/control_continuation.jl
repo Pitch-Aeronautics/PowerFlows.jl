@@ -110,14 +110,22 @@ end
 # device's primary/secondary wiring) so the closed-loop gain σ'(y)·dy/dp ≤ 0
 # (negative feedback) regardless of wiring. `_sigmoid(lo,hi,…)` decreases in y when hi>lo.
 # `y` is the regulated quantity — bus voltage for every currently supported device family.
+#
+# The sigmoid maps the regulated quantity to an absolute parameter in [lo, hi], so two devices
+# with the same limits are driven to the same parameter. A unit of a parallel tap group maps
+# into its window shifted by its offset from the group (`_sigmoid_offset`), so the units move by
+# the same amount and keep their ratio offset (clamped to their own limits).
 @inline function _control_target(d, y::Float64, S::Float64, dydp::Float64)
     lo, hi = parameter_limits(d)
+    w = _sigmoid_offset(d)
     return if dydp > 0.0
-        clamp(_sigmoid(lo, hi, S, y, control_setpoint(d)), lo, hi)
+        clamp(_sigmoid(lo + w, hi + w, S, y, control_setpoint(d)), lo, hi)
     else
-        clamp(_sigmoid(hi, lo, S, y, control_setpoint(d)), lo, hi)
+        clamp(_sigmoid(hi + w, lo + w, S, y, control_setpoint(d)), lo, hi)
     end
 end
+_sigmoid_offset(::AbstractControlledDevice) = 0.0
+_sigmoid_offset(d::ControlledTap) = d.offset
 
 # Scale-aware settle tolerance: 1e-5 absolute is 5e-5 relative for a 0.2-wide tap band
 # but only 1e-6 relative for a 10 p.u. shunt; a relative floor lets wide-range devices
@@ -659,7 +667,15 @@ end
 # whose arc is reversed counts with its sign flipped), each member whose orientation is not
 # fixed by `tap_direction = :cont_sign` is aligned to the sign of the members' summed
 # sensitivity, the effect of moving them together; its measured magnitude still sizes its
-# steps (`aligned`, see `_forced_sign`). Agreeing groups are untouched.
+# steps (`aligned`, see `_forced_sign`).
+#
+# Every group, aligned or not, also keeps its units' ratio offsets (GAP-058). The sigmoid law
+# drives a device to an absolute parameter for a given voltage, so units at unequal ratios were
+# pulled toward one common ratio: the higher one down, the lower one up, or, where the band clamp
+# held one at its anchor, only the other moved, and the pair split (at 15 steps apart, one unit 3
+# steps, the other none). Each unit's `offset` is its ratio less the mean of the units that share
+# its arc orientation, and its sigmoid window is shifted by it (`_control_target`), so the units
+# move by the same amount, as PSS/E steps parallel units together.
 function _align_parallel_taps!(taps::Vector{ControlledTap}, dVdp::Vector{Float64},
     frozen::Vector{Bool})
     length(taps) < 2 && return
@@ -672,6 +688,14 @@ function _align_parallel_taps!(taps::Vector{ControlledTap}, dVdp::Vector{Float64
     for members in values(groups)
         length(members) < 2 && continue
         orient(i) = taps[i].from_ix < taps[i].to_ix ? 1 : -1
+        for o in (1, -1)
+            same = [i for i in members if orient(i) == o]
+            isempty(same) && continue
+            m = sum(taps[i].current for i in same) / length(same)
+            for i in same
+                taps[i].offset = taps[i].current - m
+            end
+        end
         signs = [sign(dVdp[i]) * orient(i) for i in members]
         all(==(signs[1]), signs) && continue
         total = sum(dVdp[i] * orient(i) for i in members)
@@ -902,6 +926,7 @@ function _control_continuation!(
         d.side = 0
         d.anchor = d.current
         d.aligned = 0
+        d.offset = 0.0
     end
     for d in set.shunts
         d.side = 0
