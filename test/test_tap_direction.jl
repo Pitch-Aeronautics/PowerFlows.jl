@@ -1,13 +1,17 @@
-# Tap orientation: by measured dV/dtap (default), by PSS/E's CONT1 sign convention
+# Tap orientation: by measured dV/dtap (default), by PSS/E's CONT1 convention (a terminal bus
+# on its own winding's side, a remote bus by the sign)
 # (`tap_direction = :cont_sign`), and parallel taps on one regulated bus aligned.
 
 """REF(1) ─line(x = `xline`)─ F(2) ─tap F→T─ T(3) with a PV generator at T (|V₃| = 1.0) and a
 load at F. The tap regulates its own winding-1 bus F (`regulated_bus_number = 2`), band
-[`vmi`, `vma`] as the PSS/E parser stores it. With T held, raising the ratio pushes reactive
-power into F, so the measured dV_F/dtap is positive; PSS/E's convention reads CONT1 > 0 as
-"bus on the winding-2 side", where raising the ratio lowers the voltage."""
+[`vmi`, `vma`] as the PSS/E parser stores it; with `remote`, a load bus R(4) hangs off F by a
+short line and the tap regulates R instead, a bus that is neither terminal. With T held,
+raising the ratio pushes reactive power into F (and R), so the measured dV/dtap is positive.
+PSS/E puts a terminal bus on its own winding's side whatever CONT1's sign, so F is on the
+winding-1 side; R is placed by the sign, CONT1 > 0 reading "winding-2 side", where raising the
+ratio lowers the voltage."""
 function _winding1_regulated_tap_system(; cont1 = 2, vmi = 1.0, vma = 1.02, tap = 1.0,
-    xline = 0.2, psse_ext::Bool = false)
+    xline = 0.2, psse_ext::Bool = false, remote::Bool = false)
     sys = System(100.0)
     b1 = _add_simple_bus!(sys, 1, ACBusTypes.REF, 230, 1.0, 0.0)
     _add_simple_source!(sys, b1, 0.0, 0.0)
@@ -16,6 +20,11 @@ function _winding1_regulated_tap_system(; cont1 = 2, vmi = 1.0, vma = 1.02, tap 
     _add_simple_line!(sys, b1, bf, 0.01, xline, 0.0)
     _add_simple_load!(sys, bf, 20.0, 15.0)
     _add_simple_thermal_standard!(sys, bt, 0.0, 0.0)
+    if remote
+        br = _add_simple_bus!(sys, 4, ACBusTypes.PQ, 230, 1.0, 0.0)
+        _add_simple_line!(sys, bf, br, 0.002, 0.01, 0.0)
+        _add_simple_load!(sys, br, 2.0, 1.0)
+    end
     ext = Dict{String, Any}("VMI1" => vmi, "VMA1" => vma)
     if psse_ext
         ext["psse"] = Dict{String, Any}("CONT1" => cont1)
@@ -39,18 +48,25 @@ function _solve_direction(sys, direction)
     return d, data.bus_magnitude[d.controlled_ix, 1], data
 end
 
-@testset "tap direction: CONT1 sign read from ext, option plumbing" begin
-    sys = _winding1_regulated_tap_system(; cont1 = 2)
-    tx = only(get_components(TapTransformer, sys))
-    @test PowerFlows._tap_cont_orientation(tx) == -1      # winding-2 side convention
-    sysn = _winding1_regulated_tap_system(; cont1 = -2)
-    @test PowerFlows._tap_cont_orientation(only(get_components(TapTransformer, sysn))) == 1
-    sysp = _winding1_regulated_tap_system(; cont1 = -2, psse_ext = true)
-    @test PowerFlows._tap_cont_orientation(only(get_components(TapTransformer, sysp))) == 1
+_orientation(sys) = PowerFlows._tap_cont_orientation(only(get_components(TapTransformer, sys)))
+
+@testset "tap direction: CONT1 read from ext, terminal buses by position, option plumbing" begin
+    # A terminal bus is on its own winding's side whatever the sign: the from (winding-1) bus
+    # +1, the to (winding-2) bus −1.
+    @test _orientation(_winding1_regulated_tap_system(; cont1 = 2)) == 1
+    @test _orientation(_winding1_regulated_tap_system(; cont1 = -2)) == 1
+    @test _orientation(_winding1_regulated_tap_system(; cont1 = 2, psse_ext = true)) == 1
+    @test _orientation(_winding1_regulated_tap_system(; cont1 = 3)) == -1
+    @test _orientation(_winding1_regulated_tap_system(; cont1 = -3)) == -1
+    @test _orientation(_winding1_regulated_tap_system(; cont1 = -3, psse_ext = true)) == -1
+    # A remote bus is placed by the sign: > 0 the winding-2 side, < 0 the winding-1 side.
+    @test _orientation(_winding1_regulated_tap_system(; cont1 = 4, remote = true)) == -1
+    @test _orientation(_winding1_regulated_tap_system(; cont1 = -4, remote = true)) == 1
+    @test _orientation(
+        _winding1_regulated_tap_system(; cont1 = -4, remote = true, psse_ext = true)) == 1
     # An API-built tap has no CONT1: measured orientation.
-    sys_api = _make_solvable_tap_shunt_system()
-    @test PowerFlows._tap_cont_orientation(only(get_components(TapTransformer, sys_api))) ==
-          0
+    @test _orientation(_make_solvable_tap_shunt_system()) == 0
+    sys = _winding1_regulated_tap_system(; cont1 = 4, remote = true)
     data = PowerFlowData(ACPolarPowerFlow(), sys)
     bl = PF.get_bus_lookup(data)
     @test only(PowerFlows.build_controlled_device_set(sys, bl, data.power_network_matrix;
@@ -64,7 +80,7 @@ end
     @test_throws ArgumentError ACPolarPowerFlow(; tap_direction = :psse)
 end
 
-@testset "tap direction: the two orientations disagree on a winding-1 regulated tap" begin
+@testset "tap direction: a tap regulating its own winding-1 bus raises the ratio, whatever CONT1's sign" begin
     sys0 = _winding1_regulated_tap_system()
     base = PowerFlowData(ACPolarPowerFlow(), sys0)
     @test solve_power_flow!(base)
@@ -74,14 +90,36 @@ end
     d_s, v_s, _ = _solve_direction(_winding1_regulated_tap_system(), :sensitivity)
     @test d_s.current > d_s.initial
     @test 1.0 - PowerFlows.CONTROL_TAP_BAND_TOL <= v_s <= 1.02
-    # PSS/E's convention with CONT1 = +2 (winding-2 side): lower the ratio to raise the
-    # voltage. Here that lowers |V_F|, so the tap runs to its lower limit, short of the band.
-    d_c, v_c, _ = _solve_direction(_winding1_regulated_tap_system(), :cont_sign)
+    # PSS/E puts F on winding 1 by position, for CONT1 = +2 (as PSS/E files store a terminal
+    # bus) and −2 alike: the same answer as the measured orientation.
+    for c in (2, -2)
+        d_c, v_c, _ = _solve_direction(_winding1_regulated_tap_system(; cont1 = c),
+            :cont_sign)
+        @test d_c.orientation == 1
+        @test d_c.current == d_s.current
+        @test v_c ≈ v_s atol = 1e-8
+    end
+end
+
+@testset "tap direction: a remote regulated bus is placed by CONT1's sign" begin
+    base = PowerFlowData(ACPolarPowerFlow(),
+        _winding1_regulated_tap_system(; cont1 = 4, remote = true))
+    @test solve_power_flow!(base)
+    v0 = base.bus_magnitude[PF.get_bus_lookup(base)[4], 1]
+    @test v0 < 1.0
+    sysr(c) = _winding1_regulated_tap_system(; cont1 = c, remote = true)
+    d_s, v_s, _ = _solve_direction(sysr(4), :sensitivity)
+    @test d_s.controlled_ix ∉ (d_s.from_ix, d_s.to_ix)
+    @test d_s.current > d_s.initial
+    @test 1.0 - PowerFlows.CONTROL_TAP_BAND_TOL <= v_s <= 1.02
+    # CONT1 = +4 says "winding-2 side": lower the ratio to raise the voltage. R hangs off F, so
+    # that lowers |V_R|, and the tap runs to its lower limit, short of the band.
+    d_c, v_c, _ = _solve_direction(sysr(4), :cont_sign)
     @test d_c.orientation == -1
     @test d_c.current == d_c.p_min
     @test v_c < v0
-    # CONT1 = −2 (winding-1 side) agrees with the measurement: same answer as :sensitivity.
-    d_n, v_n, _ = _solve_direction(_winding1_regulated_tap_system(; cont1 = -2), :cont_sign)
+    # CONT1 = −4 (winding-1 side) agrees with the measurement: same answer as :sensitivity.
+    d_n, v_n, _ = _solve_direction(sysr(-4), :cont_sign)
     @test d_n.orientation == 1
     @test d_n.current == d_s.current
     @test v_n ≈ v_s atol = 1e-8
@@ -144,10 +182,12 @@ end
     @test all(d.current <= d.initial for d in values(taps))   # neither raises its ratio
     @test taps["A"].current < taps["A"].initial
     @test 1.04 - PowerFlows.CONTROL_TAP_BAND_TOL <= v <= 1.05
-    # PSS/E's CONT sign convention (CONT1 = +3, winding-2 side for both) also moves them
-    # the same way.
-    taps_c, v_c, _ = _solve_parallel(; direction = :cont_sign, cont1 = 3)
-    @test all(d.orientation == -1 for d in values(taps_c))
-    @test all(d.current <= d.initial for d in values(taps_c))
-    @test 1.04 - PowerFlows.CONTROL_TAP_BAND_TOL <= v_c <= 1.05
+    # PSS/E's CONT convention also moves them the same way.
+    # T is both units' to bus, so a terminal on winding 2 whatever CONT1's sign.
+    for c in (3, -3)
+        taps_c, v_c, _ = _solve_parallel(; direction = :cont_sign, cont1 = c)
+        @test all(d.orientation == -1 for d in values(taps_c))
+        @test all(d.current <= d.initial for d in values(taps_c))
+        @test 1.04 - PowerFlows.CONTROL_TAP_BAND_TOL <= v_c <= 1.05
+    end
 end

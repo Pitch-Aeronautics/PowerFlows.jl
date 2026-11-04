@@ -214,14 +214,21 @@ function _tap_cont1(tx)
     return c
 end
 
-"""Orientation of a tap under PSS/E's CONT sign convention (PSS/E raw-data notes on CONT1: a
-positive CONT1 adjusts the ratio as if the controlled bus were on the winding-2 side, a
-negative one as if it were on the winding-1 side). The tap ratio is the winding-1 (`from`)
-ratio, so on the winding-2 side raising it lowers the voltage (−1), on the winding-1 side it
-raises it (+1). 0 (orient by measured sensitivity) without a CONT1."""
+"""Orientation of a tap under PSS/E's CONT convention. The tap ratio is the winding-1 (`from`)
+ratio, so for a bus on the winding-2 side raising it lowers the voltage (−1), and for one on the
+winding-1 side it raises it (+1). PSS/E places the controlled bus by position first: a CONT1
+equal to a terminal bus is on that terminal's own winding (the `from` bus +1, the `to` bus −1)
+whatever its sign. Only a remote bus, neither terminal, is placed by the sign (raw-data notes on
+CONT1): positive as if on the winding-2 side (−1), negative as if on the winding-1 side (+1).
+So a system as PowerSystems parses it (the raw CONT1, sign included, in `ext`) orients as PSS/E
+does. 0 (orient by measured sensitivity) without a CONT1."""
 function _tap_cont_orientation(tx)
     c = _tap_cont1(tx)
     isnothing(c) && return 0
+    arc = PSY.get_arc(tx)
+    bus = abs(c)
+    bus == PSY.get_number(PSY.get_from(arc)) && return 1
+    bus == PSY.get_number(PSY.get_to(arc)) && return -1
     return c > 0 ? -1 : 1
 end
 
@@ -276,8 +283,9 @@ once inside, snap to the nearest step of the input-order chains.
 
 `tap_direction = :sensitivity` (the default) orients every tap by its measured dV/dp, with
 parallel taps regulating one bus aligned when they measure opposite signs (see
-`_align_parallel_taps!`). `:cont_sign` orients a tap with a signed CONT1 in `ext` by PSS/E's
-convention instead (see `_tap_cont_orientation`); taps without one stay on the measured sign."""
+`_align_parallel_taps!`). `:cont_sign` orients a tap with a CONT1 in `ext` as PSS/E does instead
+(a terminal bus on its own winding's side, a remote bus by CONT1's sign; see
+`_tap_cont_orientation`); taps without one stay on the measured sign."""
 function build_controlled_device_set(
     sys,
     bus_lookup::Dict{Int, Int},

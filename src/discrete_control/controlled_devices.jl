@@ -23,10 +23,10 @@ regulating) and `anchor` the tap where it latched; both are continuation scratch
 start of every `_control_continuation!`. Without a band the tap is driven to `vset`.
 
 Orientation: the continuation orients a tap by its measured dV/dp. With `orientation` ±1
-(`tap_direction = :cont_sign`, from the sign of PSS/E's CONT1) the sign of dV/dp is fixed
-instead, as PSS/E adjusts the ratio: CONT1 > 0 as if the regulated bus were on the winding-2
-(to) side, so raising the ratio lowers its voltage (−1); CONT1 < 0 as if on the winding-1
-(from) side (+1). The measured magnitude still sizes each step. `aligned` is set when parallel
+(`tap_direction = :cont_sign`, from PSS/E's CONT1) the sign of dV/dp is fixed instead, as PSS/E
+adjusts the ratio: a regulated bus on the winding-2 (to) side, where raising the ratio lowers
+its voltage, is −1, one on the winding-1 (from) side +1. A terminal bus is on its own side; a
+remote bus is placed by CONT1's sign, > 0 the winding-2 side, < 0 the winding-1 side. The measured magnitude still sizes each step. `aligned` is set when parallel
 taps regulating one bus measure opposite signs (see `_align_parallel_taps!`)."""
 mutable struct ControlledTap <: AbstractBranchControl
     name::String
