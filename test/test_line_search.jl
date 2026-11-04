@@ -172,10 +172,9 @@ end
     @test !isnothing(t) && t[1] >= 1 && t[3] >= 1
 end
 
-"""T69's configuration on three buses (GAP-060): REF(1) feeds a star point (2, PQ, 50 MW load)
-through four parallel windings at a 1.05 ratio and 3e-4 pu each, the way WECC's generator
-step-ups do; a PV generator (3, 100 MW, |V| 1.02) sits behind the star on a 0.3 pu winding
-(ratio 0.9565). With `ltc`, a 69 kV load bus (4) hangs off the REF bus through a
+"""A synthetic generator step-up on three buses (T69): REF(1) feeds a star point (2, PQ, 50 MW
+load) through four parallel windings at a 1.05 ratio and 3e-4 pu each; a PV generator (3,
+100 MW, |V| 1.02) sits behind the star on a 0.3 pu winding (ratio 0.9565). With `ltc`, a 69 kV load bus (4) hangs off the REF bus through a
 voltage-controlled tap (regulating bus 4)."""
 function _ls_t69_system(; ltc::Bool = false)
     sys = System(100.0)
