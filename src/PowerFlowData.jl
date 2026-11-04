@@ -587,6 +587,7 @@ function make_and_initialize_power_flow_data(
     )
     @assert length(data.lcc.setpoint_at_rectifier) == n_lccs
     initialize_power_flow_data!(data, pf, sys; correct_bustypes = get_correct_bustypes(pf))
+    _debit_facts_warm_start!(data, controlled_devices)
     return data
 end
 

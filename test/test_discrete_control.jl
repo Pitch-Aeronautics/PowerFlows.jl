@@ -1838,3 +1838,72 @@ end
     d, v, _ = _solve_banded_shunt(0.95, 0.95; steps = [4, 2], dB = [-0.05, 0.1])
     @test d.current in d.levels
 end
+
+# ── FACTS: rail snap, exact finish, warm start ──────────────────────────────────────────────
+@testset "FACTS: a device that cannot reach vset ends exactly on its rail, saturated" begin
+    # STATCOM at IEEE 14 bus 14, 5 MVA, loads ×1.6, bus-9 shunt off: the setpoint is out of
+    # reach. PSS/E holds such a device at |Q| = SHMX·V; it ends there exactly.
+    sys = build_ieee14_facts_system(; shmx_mva = 5.0, stress = 1.6, shunt9_off = true)
+    data = PowerFlowData(ACPolarPowerFlow(; control_discrete_devices = true), sys)
+    tl = Test.TestLogger(; min_level = Logging.Warn)
+    ok = Logging.with_logger(tl) do
+        solve_power_flow!(data)
+    end
+    @test ok
+    @test !any(occursin("did not settle", r.message) for r in tl.logs)
+    f = only(PF.get_controlled_devices(data).facts)
+    v = data.bus_magnitude[f.controlled_ix, 1]
+    @test f.vset - v > PowerFlows.CONTROL_FACTS_SETPOINT_BAND
+    @test f.current == f.b_lim
+    @test f.b_lim ≈ PowerFlows._facts_b_limit(f, v) rtol = 1e-9
+    @test f.saturated
+    # STATCOM law: delivered Q = b·V² = rating·V (here the device regulates its own bus).
+    @test f.current * v^2 ≈ f.rating * v rtol = 1e-9
+end
+
+@testset "FACTS: a device free in range ends on its setpoint" begin
+    sys = build_ieee14_facts_system(; shmx_mva = 25.0)
+    data = PowerFlowData(ACPolarPowerFlow(; control_discrete_devices = true), sys)
+    @test solve_power_flow!(data)
+    f = only(PF.get_controlled_devices(data).facts)
+    @test abs(data.bus_magnitude[f.controlled_ix, 1] - f.vset) < 1e-6
+    @test abs(f.current) < f.b_lim
+    @test !f.saturated
+end
+
+@testset "FACTS: warm start from reactive_power_required" begin
+    # Unit: b = Q / (base·|V|²) at the device bus's stored |V|, clamped to ±rating.
+    sys = _make_svc_system(; max_shunt_current = 100.0)
+    fd = only(get_components(FACTSControlDevice, sys))
+    set_reactive_power_required!(fd, 42.0)
+    set_magnitude!(get_bus(fd), 1.05)
+    @test PowerFlows._facts_warm_start(fd, 100.0, 1.0) ≈ 0.42 / 1.05^2
+    set_reactive_power_required!(fd, 500.0)
+    @test PowerFlows._facts_warm_start(fd, 100.0, 1.0) == 1.0
+    set_reactive_power_required!(fd, 0.0)
+    @test PowerFlows._facts_warm_start(fd, 100.0, 1.0) == 0.0
+    # The store and the withdrawal agree: the warm b is debited from the bus's constant-Z
+    # reactive withdrawal, so a solve with control off sees the stored Q.
+    sys = _make_svc_system(; max_shunt_current = 100.0)
+    set_reactive_power_required!(only(get_components(FACTSControlDevice, sys)), 0.0)
+    cold = PowerFlowData(ACPolarPowerFlow(; control_discrete_devices = true), sys)
+    @test solve_power_flow!(cold)
+    n_cold = PF.get_control_inner_solve_count(cold)
+    f_cold = only(PF.get_controlled_devices(cold).facts)
+    @test abs(cold.bus_magnitude[f_cold.controlled_ix, 1] - f_cold.vset) < 1e-6
+    # Store the solved Q and |V| (as solve_and_store does), rebuild: it starts at the answer.
+    PowerFlows.write_device_settings!(sys, cold)
+    bus = get_bus(only(get_components(FACTSControlDevice, sys)))
+    set_magnitude!(bus, cold.bus_magnitude[f_cold.bus_ix, 1])
+    warm = PowerFlowData(ACPolarPowerFlow(; control_discrete_devices = true), sys)
+    f_warm = only(PF.get_controlled_devices(warm).facts)
+    @test f_warm.initial ≈ f_cold.current rtol = 1e-9
+    ix = f_warm.bus_ix
+    # Built warm, the withdrawal already carries b, as the cold solve's did once it ended.
+    @test warm.bus_reactive_power_constant_impedance_withdrawals[ix, 1] ≈
+          cold.bus_reactive_power_constant_impedance_withdrawals[ix, 1]
+    @test solve_power_flow!(warm)
+    @test abs(warm.bus_magnitude[f_warm.controlled_ix, 1] - f_warm.vset) < 1e-6
+    @test f_warm.current ≈ f_cold.current rtol = 1e-6
+    @test PF.get_control_inner_solve_count(warm) < n_cold
+end

@@ -42,6 +42,9 @@ const CONTROL_BAND_SETTLE_SWEEPS = 4
 # step clamps at a limit.
 const CONTROL_FINISH_VTOL = 1e-9
 const CONTROL_FINISH_MAX_ROUNDS = 20
+# Rail snap (`_damped_target!`): a continuous device saturating toward a bound is put on it once
+# it is within this fraction of its range of the bound.
+const CONTROL_RAIL_SNAP_REACH = 0.1
 # Post-solve saturation classification band for a continuous FACTS device: |V−vset| within
 # this is "at setpoint". A device pinned at its V-dependent susceptance bound with |V−vset|
 # above this is reported saturated (the homotopy analogue of a PV→PQ Q-limit release). Matches

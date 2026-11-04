@@ -1063,7 +1063,11 @@ function _add_facts_shunt!(
         control_mode = PSY.FACTSOperationModes.NML,
         voltage_setpoint = voltage_setpoint,
         max_shunt_current = max_shunt_current,
-        reactive_power_required = 100.0,
+        # Unsolved: no stored Q, so the device starts from b = 0. (A stored Q is now the
+        # warm start; the former placeholder 100 MVAr at bus 14 started it at b = 1.0 p.u.,
+        # the high voltage flipped generators to PQ at their Q floors, and those flips are
+        # one-way.)
+        reactive_power_required = 0.0,
     )
     add_component!(sys, facts)
     return facts

@@ -520,8 +520,25 @@ function _damped_target!(
         end
     end
     prev_sign[idx] = s
-    return _band_clamp(d, clamp(p_now + ω * (p_tgt - p_now), lo, hi), dv), yc, true
+    p_new = clamp(p_now + ω * (p_tgt - p_now), lo, hi)
+    # Rail snap (continuous devices): a target within tol_d of a bound, with the regulated
+    # quantity still off its setpoint, is the device saturating (the PV→PQ analogue). The damped
+    # step ω·(bound − p) shrinks toward tol_d as the steepness grows, so the walk would stall
+    # short of the rail (~6 % of range for FACTS at S = 5000) and use up the stage's pass budget:
+    # apply the bound itself. Only from within CONTROL_RAIL_SNAP_REACH of it: from farther away
+    # (a far-off start, an early low-steepness stage) a jump to the rail can overshoot onto
+    # another solution branch, and the damped walk is not yet creeping there.
+    if _rail_snaps(d) && abs(yc - control_setpoint(d)) > CONTROL_FACTS_SETPOINT_BAND
+        reach = CONTROL_RAIL_SNAP_REACH * (hi - lo)
+        p_tgt >= hi - tol_d && hi - p_now <= reach && (p_new = hi)
+        p_tgt <= lo + tol_d && p_now - lo <= reach && (p_new = lo)
+    end
+    return _band_clamp(d, p_new, dv), yc, true
 end
+
+_rail_snaps(::AbstractControlledDevice) = false
+_rail_snaps(::ControlledFACTS) = true
+_rail_snaps(d::ControlledSwitchedShunt) = !isnothing(_continuous_target(d))
 
 # Freeze on a detected plant-gain sign reversal (OLTC reverse action) or a collapse below the
 # effectiveness floor; otherwise accept the refreshed gain `g`. `dv` is the pre-refresh gain.
@@ -1004,7 +1021,7 @@ function _control_continuation!(
             (S=$S); regulation may be loose at time step $ts"
     end
     ok = snap_and_restore!(pf, data, set, ts, scratch_snap; kwargs...)
-    # Continuous shunts that are regulating end on their target exactly, or at a limit.
+    # Regulating continuous devices (shunts, FACTS) end on their target exactly, or at a limit.
     ok && _continuous_finish!(pf, data, set, ts, scratch_snap, frozen, dVdp, n_shared,
         n_taps; kwargs...)
     # Classify each FACTS endpoint against its final voltage-dependent bound and setpoint
@@ -1020,27 +1037,88 @@ function _control_continuation!(
     return ok
 end
 
-# ── Exact finish for continuous switched shunts ───────────────────────────────────────────
+# ── Exact finish for continuous devices ──────────────────────────────────────────────────
 # The sigmoid law's fixed point at the final steepness sits off the target by ~ln(·)/S, and a
-# device that should be pinned at a susceptance limit stops short of it while the sigmoid is
-# not fully saturated. Over a zero-width band (VSWLO = VSWHI: a setpoint, as WECC models
-# PSLF-style SVDs) that residue is the whole answer: measured on a WECC replay, 0.2–3.6 % of
-# range (up to 7.6e-4 p.u. of voltage) off a free device's setpoint, and 0.9–1.8 % of range
-# short of the limit of one PSS/E pins there. So after the snap a continuous shunt that is
-# regulating (a zero-width band, or a banded shunt latched on an edge) takes undamped Newton
-# steps on its own susceptance, B ← clamp(B − (V − V*)/(dV/dB)), all devices together with one
-# joint solve per round and a secant refresh of dV/dB, until |V − V*| ≤ CONTROL_FINISH_VTOL or
-# the step clamps at a limit (the device is then exactly at that limit). A banded shunt never
-# retreats past its anchor (`_band_clamp`). A failed round rolls back to the last converged
-# state with a warning.
+# device that should be pinned at a limit stops short of it while the sigmoid is not fully
+# saturated. Over a zero-width band (VSWLO = VSWHI: a setpoint, as WECC models PSLF-style SVDs)
+# that residue is the whole answer: measured on a WECC replay, 0.2–3.6 % of range (up to 7.6e-4
+# p.u. of voltage) off a free device's setpoint, and 0.9–1.8 % of range short of the limit of
+# one PSS/E pins there; FACTS that PSS/E holds at |Q| = SHMX·V ended at 0.94 of their bound,
+# neither at setpoint nor classified saturated. So after the snap every regulating continuous
+# device (a continuous switched shunt with a zero-width band or latched on an edge, and every
+# FACTS) takes undamped Newton steps on its own susceptance, b ← clamp(b − (y − y*)/(dy/db)),
+# all devices together with one joint solve per round and a secant refresh of dy/db, until
+# |y − y*| ≤ CONTROL_FINISH_VTOL or the step clamps at a limit (the device then sits exactly
+# there; a FACTS's |V|-dependent bound is refreshed every round). A banded shunt never retreats
+# past its anchor (`_band_clamp`). A failed round rolls back to the last converged state with a
+# warning.
 
-# The voltage a continuous shunt is held to at the end, or `nothing` when it is not regulating
-# (a discrete shunt, or one held inside a nonzero band).
+# The quantity a continuous device is held to at the end, or `nothing` when it is not
+# regulating (a discrete shunt, or one held inside a nonzero band).
 function _continuous_target(d::ControlledSwitchedShunt)
     d.continuous || return nothing
     d.vset_lo == d.vset_hi && return d.vset
     d.band && d.side != 0 && return control_setpoint(d)
     return nothing
+end
+_continuous_target(d::ControlledFACTS) = d.vset
+
+_finish_limits!(d::ControlledSwitchedShunt, data, ts::Int) = parameter_limits(d)
+function _finish_limits!(d::ControlledFACTS, data, ts::Int)
+    d.b_lim = _facts_b_limit(d, measured_value(d, data, ts))
+    return parameter_limits(d)
+end
+
+# One Newton round's moves for one group; returns whether any device moved.
+function _finish_step_group!(devices, offset::Int, data, ts::Int, active, dVdp, n_shared,
+    prev, yprev, moved)
+    any_moved = false
+    for (j, d) in enumerate(devices)
+        idx = offset + j
+        active[idx] || continue
+        y = measured_value(d, data, ts)
+        lo, hi = _finish_limits!(d, data, ts)
+        e = y - _continuous_target(d)
+        g = dVdp[idx]
+        if abs(e) <= CONTROL_FINISH_VTOL
+            lo <= d.current <= hi && continue      # on target, within its (refreshed) limits
+            p = clamp(d.current, lo, hi)
+        else
+            p = clamp(d.current - e / (g * n_shared[idx]), lo, hi)
+        end
+        p = _band_clamp(d, p, g)
+        if abs(p - d.current) <= 1e-12 * (hi - lo)
+            active[idx] = false   # pinned at a limit (or its anchor): it stays there
+            continue
+        end
+        prev[idx] = d.current
+        yprev[idx] = y
+        apply_parameter!(d, data, p, ts)
+        moved[idx] = true
+        any_moved = true
+    end
+    return any_moved
+end
+
+function _finish_secant_group!(devices, offset::Int, data, ts::Int, dVdp, prev, yprev, moved)
+    for (j, d) in enumerate(devices)
+        idx = offset + j
+        moved[idx] || continue
+        Δy = measured_value(d, data, ts) - yprev[idx]
+        g = Δy / (d.current - prev[idx])
+        # Keep the previous gain on a noise-level or reversed secant sample.
+        if abs(Δy) > 1e-10 && sign(g) == sign(dVdp[idx])
+            dVdp[idx] = g
+        end
+    end
+    return
+end
+
+function _finish_undo_group!(devices, offset::Int, data, ts::Int, prev, moved)
+    for (j, d) in enumerate(devices)
+        moved[offset + j] && apply_parameter!(d, data, prev[offset + j], ts)
+    end
+    return
 end
 
 function _continuous_finish!(
@@ -1048,57 +1126,40 @@ function _continuous_finish!(
     frozen::Vector{Bool}, dVdp::Vector{Float64}, n_shared::Vector{Int}, n_taps::Int;
     kwargs...,
 )
-    shunts = set.shunts
-    active = [
-        !frozen[n_taps + j] && !isnothing(_continuous_target(d)) &&
-        !iszero(dVdp[n_taps + j]) for (j, d) in enumerate(shunts)
-    ]
+    n_shunts = length(set.shunts)
+    off_facts = n_taps + n_shunts
+    n = length(dVdp)
+    active = fill(false, n)
+    for (j, d) in enumerate(set.shunts)
+        idx = n_taps + j
+        active[idx] = !frozen[idx] && !isnothing(_continuous_target(d)) && !iszero(dVdp[idx])
+    end
+    for (j, _) in enumerate(set.facts)
+        idx = off_facts + j
+        active[idx] = !frozen[idx] && !iszero(dVdp[idx])
+    end
     any(active) || return true
-    m = length(shunts)
-    prev = zeros(m)
-    yprev = zeros(m)
-    moved = fill(false, m)
+    prev = zeros(n)
+    yprev = zeros(n)
+    moved = fill(false, n)
     for _ in 1:CONTROL_FINISH_MAX_ROUNDS
         fill!(moved, false)
         _capture_state!(snap, data, ts)
-        for (j, d) in enumerate(shunts)
-            active[j] || continue
-            idx = n_taps + j
-            y = measured_value(d, data, ts)
-            e = y - _continuous_target(d)
-            abs(e) <= CONTROL_FINISH_VTOL && continue
-            g = dVdp[idx]
-            lo, hi = parameter_limits(d)
-            p = _band_clamp(d, clamp(d.current - e / (g * n_shared[idx]), lo, hi), g)
-            if abs(p - d.current) <= 1e-12 * (hi - lo)
-                active[j] = false   # pinned at a limit (or its anchor): it stays there
-                continue
-            end
-            prev[j] = d.current
-            yprev[j] = y
-            apply_parameter!(d, data, p, ts)
-            moved[j] = true
-        end
-        any(moved) || return true
+        any_moved = _finish_step_group!(set.shunts, n_taps, data, ts, active, dVdp, n_shared,
+            prev, yprev, moved)
+        any_moved |= _finish_step_group!(set.facts, off_facts, data, ts, active, dVdp,
+            n_shared, prev, yprev, moved)
+        any_moved || return true
         if !_ctrl_solve!(pf, data, ts; kwargs...)
-            for (j, d) in enumerate(shunts)
-                moved[j] && apply_parameter!(d, data, prev[j], ts)
-            end
+            _finish_undo_group!(set.shunts, n_taps, data, ts, prev, moved)
+            _finish_undo_group!(set.facts, off_facts, data, ts, prev, moved)
             _restore_state!(data, ts, snap)
-            @warn "discrete control: the exact finish of a continuous switched shunt did \
-                not converge; leaving it at its last converged susceptance (time step $ts)."
+            @warn "discrete control: the exact finish of a continuous device did not \
+                converge; leaving it at its last converged setting (time step $ts)."
             return false
         end
-        for (j, d) in enumerate(shunts)
-            moved[j] || continue
-            Δp = d.current - prev[j]
-            Δy = measured_value(d, data, ts) - yprev[j]
-            g = Δy / Δp
-            # Keep the previous gain on a noise-level or reversed secant sample.
-            if abs(Δy) > 1e-10 && sign(g) == sign(dVdp[n_taps + j])
-                dVdp[n_taps + j] = g
-            end
-        end
+        _finish_secant_group!(set.shunts, n_taps, data, ts, dVdp, prev, yprev, moved)
+        _finish_secant_group!(set.facts, off_facts, data, ts, dVdp, prev, yprev, moved)
     end
     return true
 end

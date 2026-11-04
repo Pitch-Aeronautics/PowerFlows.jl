@@ -294,12 +294,18 @@ After the continuous outer loop converges (or reaches its iteration limit),
     whose step back toward its anchor would still be inside steps back (jointly,
     then alone for devices that pushed each other out), and a final forward
     pass, so each device ends at its first position inside.
-  - **Continuous finish.** A regulating continuous shunt (zero-width band, or
-    latched on an edge) then takes Newton steps on its susceptance, with one
-    joint solve per round, until its voltage is within `CONTROL_FINISH_VTOL`
-    of its target or the step clamps at a susceptance limit, where it then
-    sits exactly. Without it the sigmoid law's finite steepness leaves such a
-    device ~1e-4 p.u. off its setpoint, or short of the limit it is pinned at.
+  - **Continuous finish.** A regulating continuous device (a continuous shunt
+    with a zero-width band or latched on an edge, and every FACTS) then takes
+    Newton steps on its susceptance, with one joint solve per round, until its
+    voltage is within `CONTROL_FINISH_VTOL` of its target or the step clamps
+    at a susceptance limit (a FACTS's |V|-dependent bound refreshed every
+    round), where it then sits exactly, so a FACTS that cannot hold its
+    setpoint is classified saturated at |Q| = SHMX·V. Without it the sigmoid
+    law's finite steepness leaves such a device ~1e-4 p.u. off its setpoint,
+    or short of the limit it is pinned at. During the continuation itself a
+    continuous device whose target is within its settle tolerance of a bound
+    while it is off setpoint is put on the bound (the rail snap), instead of
+    creeping toward it in ever smaller damped steps.
 
 After snapping all devices, the inner solver is called on the discretized
 network. If it converges, the procedure is complete. If not, each device is
@@ -375,6 +381,12 @@ at BINIT; **API-built** components follow the PSY docstring (`Y` = fixed N=0
 base, `initial_status` meaningful).
 
 ### `FACTSControlDevice` → `ControlledFACTS`
+
+A FACTS device starts from its stored solution: `reactive_power_required`
+(MVA, what `write_device_settings!` writes) over `base_power·|V|²` at its bus's
+stored magnitude, clamped to `±rating`, and that susceptance is debited from the
+bus's constant-impedance reactive withdrawal when `PowerFlowData` is built.
+Without a stored Q it starts at 0.
 
 A `FACTSControlDevice` in a non-out-of-service control mode enrolls
 unconditionally (no flag) as a *continuous* shunt: it varies a symmetric

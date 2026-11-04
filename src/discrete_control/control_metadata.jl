@@ -167,6 +167,28 @@ function _shunt_susceptance_model(
     return b_fixed, current, b_min, b_max
 end
 
+"""Initial susceptance of a FACTS device: its stored delivered reactive power
+`reactive_power_required` (MVA) over `base_mva·|V|²` at its own bus's stored magnitude,
+clamped to `[-b0, b0]`; 0 without a stored Q."""
+function _facts_warm_start(fd, base_mva::Float64, b0::Float64)
+    q = PSY.get_reactive_power_required(fd)
+    iszero(q) && return 0.0
+    v = max(PSY.get_magnitude(PSY.get_bus(fd)), 1e-3)
+    return clamp(q / (base_mva * v^2), -b0, b0)
+end
+
+"""Debit each warm-started FACTS device's initial susceptance into the constant-impedance
+reactive withdrawal of its bus, every time step, so the device store and the withdrawal agree
+(the inverse of `write_device_settings!`; `apply_parameter!` moves it from there)."""
+function _debit_facts_warm_start!(data, set)
+    isnothing(set) && return
+    for d in set.facts
+        iszero(d.current) && continue
+        data.bus_reactive_power_constant_impedance_withdrawals[d.bus_ix, :] .-= d.current
+    end
+    return
+end
+
 const TAP_DIRECTIONS = (:sensitivity, :cont_sign)
 
 function _validate_tap_direction(tap_direction::Symbol)
@@ -476,6 +498,11 @@ function _enroll_facts!(
         vset = PSY.get_voltage_setpoint(fd)
         _validate_vset("ControlledFACTS", name, vset) || continue
         b0 = rating   # enrollment-time bound at unity voltage
+        # Warm start from the stored solution: `reactive_power_required` (MVA, delivered
+        # Q = b·|V|² at the device's own bus, what `write_device_settings!` writes back) at the
+        # bus's stored |V|. The withdrawal debit that matches it is applied when PowerFlowData
+        # is built (`_debit_facts_warm_start!`).
+        b_init = _facts_warm_start(fd, base_mva, b0)
         push!(
             facts,
             ControlledFACTS(
@@ -488,8 +515,8 @@ function _enroll_facts!(
                 q_cap,
                 b0,
                 base_mva,
-                0.0,               # initial (reporting)
-                0.0,               # start neutral; the controller drives b from 0
+                b_init,            # initial (reporting)
+                b_init,            # warm start (0 without a stored Q)
                 false,             # saturated (set post-solve)
             ),
         )
