@@ -299,3 +299,36 @@ end
     @test ok
     @test isnothing(PF.get_controlled_devices(data3))
 end
+
+# T68 (PowerNetworkMatrices): a phase shifter sharing its arc with a line, or with another phase
+# shifter, is a parallel set in the branch maps (before, the direct map kept only the arc's last
+# branch, so the stored-flow check failed on that arc). Each branch gets its own flow.
+@testset "phase shifter beside another branch on one arc: flows stored per branch (T68)" begin
+    for other in (:line, :pst)
+        sys = System(100.0)
+        b1 = _add_simple_bus!(sys, 1, ACBusTypes.REF, 230, 1.0, 0.0)
+        _add_simple_source!(sys, b1, 0.0, 0.0)
+        b2 = _add_simple_bus!(sys, 2, ACBusTypes.PQ, 230, 1.0, 0.0)
+        _add_simple_load!(sys, b2, 50.0, 10.0)
+        mk(name, α) = PhaseShiftingTransformer(; name = name, available = true,
+            active_power_flow = 0.0, reactive_power_flow = 0.0, arc = Arc(; from = b1, to = b2),
+            r = 0.005, x = 0.1, primary_shunt = 0.0, tap = 1.0, α = α, rating = 1.0,
+            base_power = 100.0)
+        add_component!(sys, mk("pA", deg2rad(3.0)))
+        if other == :line
+            _add_simple_line!(sys, b1, b2, 0.005, 0.1, 0.0)
+        else
+            add_component!(sys, mk("pB", deg2rad(-2.0)))
+        end
+        data = PowerFlowData(ACPolarPowerFlow(), sys)
+        @test solve_power_flow!(data)
+        arc_p = data.arc_active_power_flow_from_to[PF.get_arc_lookup(data)[(1, 2)], 1]
+        @test solve_and_store_power_flow!(ACPolarPowerFlow(), sys)
+        p = PSY.with_units_base(sys, PSY.UnitSystem.SYSTEM_BASE) do
+            [get_active_power_flow(br) for br in get_components(ACTransmission, sys)]
+        end
+        @test length(p) == 2
+        @test sum(p) ≈ arc_p atol = 1e-8
+        @test abs(p[1] - p[2]) > 0.05          # the angles split the arc unequally
+    end
+end
