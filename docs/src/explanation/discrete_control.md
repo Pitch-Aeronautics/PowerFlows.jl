@@ -462,6 +462,27 @@ correction table is re-evaluated at every angle. The solved angle is reported in
 flows, and written back with `set_α!` by `solve_and_store_power_flow!`. DC power flow keeps the
 stored angle.
 
+## Remote voltage regulation by generators
+
+A generator that regulates another bus X (PSS/E's IREG) is not a discrete device; it is part of
+the polar solve itself (`remote_voltage_control = true`, the default, on `ACPolarPowerFlow`).
+The fields come from the generator's `ext` (or `ext["psse"]`): `IREG` the regulated bus,
+`RMPCT` its percent share (default 100), `VS` X's scheduled voltage (default X's stored
+magnitude; PowerSystems' v33 reader keeps IREG and RMPCT but not VS, its v35 reader none of
+them). X is PV in the solve at that setpoint and its first state slot holds the group's total
+reactive power Q_tot; each plant regulating X has its own bus PQ, with |V| free and reactive
+injection s/Σs · Q_tot, s its RMPCT share. X's own regulating plant, if it has one, shares too.
+With `check_reactive_power_limits`, a plant past its bus's Q bound is fixed there and the shares
+renormalise; when every plant is fixed X becomes PQ, and it returns to PV at its setpoint when
+|V_X| crosses it (the PQ→PV return of the reactive-limit check, applied to the group).
+
+A device regulating X (a tap, shunt or FACTS) sees no voltage change while the group holds X,
+so its probe freezes it at its stored setting; when the group is saturated at the base solve, X
+is PQ and the device regulates it alone, to its own setpoint. Remote-regulating generators then
+no longer count as co-regulators for the shared-setpoint band of a point-setpoint shunt. The
+fast decoupled solvers and the rectangular and mixed formulations do not model remote
+regulation (each unit holds its own terminal).
+
 ## Reserved seams for future work
 
 `stamp_control!(d::AbstractControlledDevice, args...)` is defined on the

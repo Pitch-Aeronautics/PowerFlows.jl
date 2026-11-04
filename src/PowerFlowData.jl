@@ -171,6 +171,9 @@ struct PowerFlowData{
     # The reactive-limit check's PV→PQ releases (each bus's setpoint) and PQ→PV returns; see
     # `QLimitSwitchState` and `_check_q_limit_bounds!`.
     q_limit_switches::QLimitSwitchState
+    # Remote voltage regulation by generators (PSS/E IREG/RMPCT, GAP-015); empty when no
+    # generator regulates a remote bus. See `remote_voltage_control.jl`.
+    remote_voltage_control::RemoteVoltageControl
 end
 
 # aliases for specific type parameter combinations.
@@ -461,6 +464,7 @@ function PowerFlowData(
         Base.RefValue{Union{Nothing, ACJacobianStructureCache}}(nothing), # ac_jacobian_structure_cache
         Base.RefValue{Union{Nothing, SolverCache}}(nothing), # polar_nr_cache (lazily populated)
         QLimitSwitchState(), # q_limit_switches
+        RemoteVoltageControl(), # remote_voltage_control (built in make_and_initialize_power_flow_data)
     )
 end
 
@@ -597,6 +601,7 @@ function make_and_initialize_power_flow_data(
     )
     @assert length(data.lcc.setpoint_at_rectifier) == n_lccs
     initialize_power_flow_data!(data, pf, sys; correct_bustypes = get_correct_bustypes(pf))
+    _enroll_remote_voltage_control!(data, pf, sys)
     _debit_facts_warm_start!(data, controlled_devices)
     return data
 end
@@ -655,6 +660,7 @@ function _build_controlled_devices(
         shunt_voltage_band = get_shunt_voltage_band(pf),
         tap_direction = get_tap_direction(pf),
         phase_shifter_control = get_phase_shifter_control(pf),
+        remote_voltage_control = _remote_voltage_enabled(pf),
     )
     if isempty(set)
         return nothing

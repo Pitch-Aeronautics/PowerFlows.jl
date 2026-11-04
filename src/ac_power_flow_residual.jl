@@ -344,6 +344,10 @@ function _update_residual_values!(
             end
         end
     end
+    # Remote voltage regulation (GAP-015): a regulated bus's Q slot is its group's Q_tot,
+    # shared over the member plants' (PQ) buses by RMPCT.
+    has_remote_voltage_groups(data.remote_voltage_control) &&
+        _apply_remote_voltage_injections!(Q_net, x, data, time_step)
 
     if num_lcc > 0
         lcc_end = vsc_off

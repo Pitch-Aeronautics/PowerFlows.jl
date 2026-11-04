@@ -33,9 +33,12 @@ function _q_return_system(; vg = 1.03, qmin = -0.05, qmax = 0.6, units = 1, ireg
     return sys
 end
 
+# Remote regulation off: an IREG unit holds its own terminal here (GAP-027's cases); with it on
+# the group rules apply (test_remote_voltage_control.jl).
 function _q_return_data(; control = false, kw...)
     pf = ACPolarPowerFlow(;
-        check_reactive_power_limits = true, control_discrete_devices = control)
+        check_reactive_power_limits = true, control_discrete_devices = control,
+        remote_voltage_control = false)
     data = PowerFlowData(pf, _q_return_system(; kw...))
     @test solve_power_flow!(data)
     return data, PF.get_bus_lookup(data)

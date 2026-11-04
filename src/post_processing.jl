@@ -20,7 +20,8 @@ function _calculate_fixed_admittance_powers(
         b = PSY.get_bus(l)
         bus_ix = PNM.get_bus_index(PSY.get_number(b), bus_lookup, nrd)
         Vm_squared =
-            if get_bus_type(data)[bus_ix, time_step] == PSY.ACBusTypes.PQ
+            if get_bus_type(data)[bus_ix, time_step] == PSY.ACBusTypes.PQ ||
+               _rv_role(data.remote_voltage_control, bus_ix)
                 get_bus_magnitude(data)[bus_ix, time_step]^2
             else # PV/REF bus, so V is known.
                 PSY.get_magnitude(b)^2
@@ -811,7 +812,9 @@ function write_power_flow_solution!(
             bus_name = temp_bus_map[bus_number]
             bus = PSY.get_component(PSY.ACBus, sys, bus_name)
             ix = bus_lookup[bus_number]
-            bustype = data.bus_type[ix, time_step] # may not be the same as bus.bustype!
+            # may not be the same as bus.bustype! A remote-regulation member is reported PV
+            # while it shares, its regulated bus PQ (`get_reported_bus_type`).
+            bustype = get_reported_bus_type(data, ix, time_step)
             original_bustype = PSY.get_bustype(bus)
             if _bustype_write_back_needed(original_bustype, bustype)
                 @warn "Changing system bus type at bus $(PSY.get_name(bus)) to match " *
@@ -864,6 +867,10 @@ function write_power_flow_solution!(
                     _reactive_power_redistribution_pv(sys, Q_gen, bus, max_iterations)
                 end
             end
+            # A member plant's terminal is free and a regulated bus sits at its group's
+            # setpoint, so both write their solved |V|.
+            _rv_role(data.remote_voltage_control, ix) &&
+                PSY.set_magnitude!(bus, data.bus_magnitude[ix, time_step])
         else
             @warn "Buses $reduced_buses were reduced into bus $bus_number: skipping reactive" *
                   " power redistribution and leaving voltage fields unchanged for those" *
@@ -2014,7 +2021,8 @@ function update_system!(sys::PSY.System, data::PowerFlowData; time_step = 1)
     end
     for bus in PSY.get_components(PSY.ACBus, sys)
         bus_index = get_bus_lookup(data)[PSY.get_number(bus)]
-        bus_type = data.bus_type[bus_index, time_step]  # use this instead of bus.bustype to account for PV -> PQ
+        # use this instead of bus.bustype to account for PV -> PQ (and remote regulation)
+        bus_type = get_reported_bus_type(data, bus_index, time_step)
         if bus_type == PSY.ACBusTypes.REF
             # For REF bus, voltage and angle are fixed; update active and reactive
             P_gen = data.bus_active_power_injections[bus_index, time_step]
@@ -2049,5 +2057,7 @@ function update_system!(sys::PSY.System, data::PowerFlowData; time_step = 1)
                 # now both the Q and the Vm, Va are correct for this kind of buses
             end
         end
+        _rv_role(data.remote_voltage_control, bus_index) &&
+            PSY.set_magnitude!(bus, data.bus_magnitude[bus_index, time_step])
     end
 end

@@ -462,6 +462,7 @@ function _reset_q_limit_flip_flops!(data::ACPowerFlowData, time_step::Int)
     st = data.q_limit_switches
     filter!(kv -> kv[1][2] != time_step, st.flip_flops)
     filter!(k -> k[2] != time_step, st.capped)
+    _reset_remote_voltage_returns!(data, time_step)
     return
 end
 
@@ -482,9 +483,12 @@ setpoint. Every inner solve of the continuation runs this check, so the return h
 before the discrete snap.
 
 The bounds are the bus's (the sum over its units, as for the release), so a multi-unit bus
-switches as one. A unit that regulates a remote bus by IREG (`_generator_remote_bus`) holds its own
-terminal in PowerFlows, so its setpoint here is its terminal's stored |V|, the quantity its PV bus
-holds. A bus with no Q range (Qmin = Qmax) never returns. A return the next solve of the same
+switches as one. A unit that regulates a remote bus by IREG (`_generator_remote_bus`) is part of a
+remote-regulation group (`remote_voltage_control.jl`), checked by `_remote_voltage_q_limits!`: a
+plant at a limit drops out of its group's share, the regulated bus becomes PQ when every plant is
+fixed, and returns to PV at its setpoint by the same rule as below. With `remote_voltage_control
+= false` (or the fast decoupled solver) such a unit holds its own terminal, and its setpoint here
+is its terminal's stored |V|. A bus with no Q range (Qmin = Qmax) never returns. A return the next solve of the same
 Q-limit loop undoes is a flip-flop; after `MAX_Q_LIMIT_FLIP_FLOPS` in one time step's solve the
 bus stays PQ, with a warning.
 
@@ -497,13 +501,17 @@ function _check_q_limit_bounds!(
     st = data.q_limit_switches
     within_limits = true
     bus_types = view(data.bus_type, :, time_step)
+    rvc = data.remote_voltage_control
     for (ix, bt) in enumerate(bus_types)
+        # Remote-regulation groups switch as groups (`_remote_voltage_q_limits!`).
+        _rv_role(rvc, ix) && continue
         if bt == PSY.ACBusTypes.PV
             _q_limit_release!(data, st, ix, time_step) && (within_limits = false)
         elseif bt == PSY.ACBusTypes.PQ
             _q_limit_return!(data, st, ix, time_step) && (within_limits = false)
         end
     end
+    _remote_voltage_q_limits!(data, time_step) && (within_limits = false)
     return within_limits
 end
 

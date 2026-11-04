@@ -290,7 +290,13 @@ parallel taps regulating one bus aligned when they measure opposite signs (see
 `phase_shifter_control = true` (the default) enrols each `PhaseShiftingTransformer` under PSS/E
 active-power control (COD1 = 3) with complete control data (`_pst_metadata`): its angle steps
 over its positions to hold its metered MW flow inside `[VMI1, VMA1]`. `false` holds every phase
-shifter at its stored angle."""
+shifter at its stored angle.
+
+`remote_voltage_control = true` says the solve models generators' remote regulation (IREG; see
+`remote_voltage_control.jl`): a generator regulating a bus remotely then does not count as a
+co-regulator for the shared-setpoint band (`_share_regulated_setpoints!`), because while its
+group holds the bus a device regulating it sees no voltage change and is frozen, and once the
+group saturates the device is the bus's only regulator."""
 function build_controlled_device_set(
     sys,
     bus_lookup::Dict{Int, Int},
@@ -301,6 +307,7 @@ function build_controlled_device_set(
     shunt_voltage_band::Bool = true,
     tap_direction::Symbol = :sensitivity,
     phase_shifter_control::Bool = true,
+    remote_voltage_control::Bool = false,
 )
     _validate_tap_direction(tap_direction)
     taps = ControlledTap[]
@@ -460,7 +467,8 @@ function build_controlled_device_set(
     facts = ControlledFACTS[]
     _enroll_facts!(facts, sys, bus_lookup, reverse_bus_search_map)
     _share_regulated_setpoints!(shunts, taps, facts, sys, bus_lookup,
-        reverse_bus_search_map; band = shunt_voltage_band)
+        reverse_bus_search_map; band = shunt_voltage_band,
+        remote_generators = !remote_voltage_control)
 
     phase_shifters = ControlledPhaseShifter[]
     phase_shifter_control && _enroll_phase_shifters!(
@@ -631,15 +639,19 @@ sharing its bus with a remote-regulating generator, which PowerFlows models as h
 terminal, took the generator's part, a large ΔB for a ~1e-4 p.u. error. PSS/E adjusts a
 switched shunt only while its voltage is off setpoint; with another device holding the bus
 there, it stays. Under the band the stored split is kept, and a device still acts when the
-others cannot hold the bus."""
+others cannot hold the bus.
+
+`remote_generators = false` (the solve models remote regulation, GAP-015) leaves IREG
+generators out of the count."""
 function _share_regulated_setpoints!(shunts, taps, facts, sys, bus_lookup,
-    reverse_bus_search_map; band::Bool = true)
+    reverse_bus_search_map; band::Bool = true, remote_generators::Bool = true)
     any(d -> d.continuous && d.vset_lo == d.vset_hi, shunts) || return
     counts = Dict{Int, Int}()
     _count_controlled_buses!(counts, taps)
     _count_controlled_buses!(counts, shunts)
     _count_controlled_buses!(counts, facts)
     for g in PSY.get_available_components(PSY.Generator, sys)
+        remote_generators || break
         r = _generator_remote_bus(g)
         isnothing(r) && continue
         rix = _resolve_bus_ix(bus_lookup, reverse_bus_search_map, r)

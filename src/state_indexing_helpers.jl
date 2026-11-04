@@ -85,6 +85,9 @@ function update_state!(x::Vector{Float64},
         end
     end
     @assert state_variable_count - 1 == size(data.bus_type, 1) * 2
+    # A regulated bus's Q slot holds its group's Q_tot (GAP-015).
+    has_remote_voltage_groups(data.remote_voltage_control) &&
+        _remote_voltage_state!(x, data, time_step)
     for i in eachindex(data.lcc.p_set[:, time_step])
         x[state_variable_count] = data.lcc.rectifier.tap[i, time_step]
         x[state_variable_count + 1] = data.lcc.inverter.tap[i, time_step]
@@ -140,6 +143,8 @@ function update_data!(data::ACPowerFlowData,
             _set_state_variables_at_bus(ix, x, data, time_step, Val(PSY.ACBusTypes.PQ))
         end
     end
+    has_remote_voltage_groups(data.remote_voltage_control) &&
+        _apply_remote_voltage_injections!(nothing, x, data, time_step)
 end
 
 # dispatching on Val for performance reasons.

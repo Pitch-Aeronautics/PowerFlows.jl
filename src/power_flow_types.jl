@@ -418,6 +418,14 @@ with the specified solver type.
     `MIN_INTERCHANGE_TOLERANCE` with a warning. Default is `DEFAULT_INTERCHANGE_TOLERANCE`.
 - `tie_definition::Symbol`: How area ties are identified. Only `:lines_only` is implemented;
     `:lines_and_loads` (PSS/E control code 2) is reserved. Default is `:lines_only`.
+- `remote_voltage_control::Bool`: Solve PSS/E remote voltage regulation by generators: a
+    generator whose `ext` names a regulated bus other than its own (`IREG`, with its share
+    `RMPCT` and the scheduled voltage `VS`, each in `ext` or `ext["psse"]`) holds that bus at
+    the setpoint, its own terminal voltage free, and the plants regulating one bus share its
+    reactive power by RMPCT (with Q limits, a plant at a limit drops out and the bus becomes
+    PQ when all are). Has no effect when no generator names a remote bus. Not supported by the
+    fast decoupled solvers (each unit then holds its own terminal, with a warning). `false`
+    makes every generator hold its own terminal. Default is `true`.
 - `solver_settings::Dict{Symbol, Any}`: Additional keyword arguments to pass to the solver.
     Default is an empty dictionary.
 """
@@ -448,6 +456,7 @@ struct ACPolarPowerFlow{ACSolver <: ACPowerFlowSolverType} <: AbstractACPowerFlo
     area_interchange_control::Bool
     interchange_tolerance::Float64
     tie_definition::Symbol
+    remote_voltage_control::Bool
     solver_settings::Dict{Symbol, Any}
 end
 
@@ -511,6 +520,7 @@ function ACPolarPowerFlow{ACSolver}(;
     area_interchange_control::Bool = false,
     interchange_tolerance::Float64 = DEFAULT_INTERCHANGE_TOLERANCE,
     tie_definition::Symbol = :lines_only,
+    remote_voltage_control::Bool = true,
     solver_settings::AbstractDict = Dict{Symbol, Any}(),
 ) where {ACSolver <: ACPowerFlowSolverType}
     settings = Dict{Symbol, Any}(solver_settings)
@@ -553,6 +563,7 @@ function ACPolarPowerFlow{ACSolver}(;
         area_interchange_control,
         validated_interchange_tolerance,
         tie_definition,
+        remote_voltage_control,
         settings,
     )
 end
@@ -599,6 +610,8 @@ get_tap_direction(pf::AbstractACPowerFlow) = pf.tap_direction
 get_tap_direction(::PowerFlowEvaluationModel) = :sensitivity
 get_phase_shifter_control(pf::AbstractACPowerFlow) = pf.phase_shifter_control
 get_phase_shifter_control(::PowerFlowEvaluationModel) = true
+get_remote_voltage_control(pf::ACPolarPowerFlow) = pf.remote_voltage_control
+get_remote_voltage_control(::PowerFlowEvaluationModel) = false
 
 get_area_interchange_control(pf::AbstractACPowerFlow) = pf.area_interchange_control
 get_area_interchange_control(::PowerFlowEvaluationModel) = false

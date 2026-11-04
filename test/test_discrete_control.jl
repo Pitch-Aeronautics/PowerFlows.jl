@@ -2005,8 +2005,11 @@ function _shared_bus_stored(; kw...)
     return data.bus_magnitude[bl[3], 1], data.bus_reactive_power_injections[bl[2], 1]
 end
 
+# Remote regulation off: GAP-056's band is the stopgap for an IREG generator PowerFlows does not
+# model; with it on, the generator holds X (test_remote_voltage_control.jl).
 function _shared_bus_solve(; kw...)
-    data = PowerFlowData(ACPolarPowerFlow(; control_discrete_devices = true),
+    data = PowerFlowData(
+        ACPolarPowerFlow(; control_discrete_devices = true, remote_voltage_control = false),
         _shared_bus_system(; kw...))
     @test solve_power_flow!(data)
     bl = PF.get_bus_lookup(data)

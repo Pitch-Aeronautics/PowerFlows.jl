@@ -20,6 +20,9 @@ struct ControlStateSnapshot
     lcc_rectifier_angle::Vector{Float64}
     lcc_inverter_angle::Vector{Float64}
     lcc_i_dc::Vector{Float64}
+    # Remote-regulation members' Q-limit status (GAP-015): the inner solve's Q-limit check fixes
+    # and frees them like the PV↔PQ switches above. Empty without remote-regulation groups.
+    rv_status::Vector{Int8}
 end
 
 @inline function _dc_state_cols(data, ts::Int)
@@ -49,6 +52,7 @@ end
         data.bus_reactive_power_injections[:, ts],
         dc_p, dc_q, dc_v,
         lcc_rt, lcc_it, lcc_ra, lcc_ia, lcc_idc,
+        _rv_status_column(data.remote_voltage_control, ts),
     )
 end
 @inline function _capture_state!(snap::ControlStateSnapshot, data, ts::Int)
@@ -71,6 +75,8 @@ end
         snap.lcc_inverter_angle .= view(lcc.inverter.thyristor_angle, :, ts)
         snap.lcc_i_dc .= view(lcc.i_dc, :, ts)
     end
+    isempty(snap.rv_status) ||
+        (snap.rv_status .= view(data.remote_voltage_control.status, :, ts))
     return
 end
 @inline function _restore_state!(data, ts::Int, snap::ControlStateSnapshot)
@@ -95,6 +101,8 @@ end
         # Re-derive phi/branch_admittances at the restored state.
         _update_ybus_lcc!(data, ts)
     end
+    isempty(snap.rv_status) ||
+        (view(data.remote_voltage_control.status, :, ts) .= snap.rv_status)
     return
 end
 

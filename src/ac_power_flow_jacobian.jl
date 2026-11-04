@@ -503,6 +503,7 @@ function _create_jacobian_matrix_structure(
         end
     end
 
+    _create_jacobian_matrix_structure_remote_voltage!(rows, columns, values, data)
     _create_jacobian_matrix_structure_lcc(data, rows, columns, values, num_buses)
     _create_jacobian_matrix_structure_vsc(data, rows, columns, values, num_buses)
     _create_jacobian_matrix_structure_area(data, rows, columns, values)
@@ -986,6 +987,8 @@ function _update_jacobian_matrix_values!(
         end
     end
 
+    has_remote_voltage_groups(data.remote_voltage_control) &&
+        _set_entries_for_remote_voltage!(Jv, data, time_step)
     _set_entries_for_lcc(data, Jv, num_buses, time_step)
     _set_entries_for_vsc(data, Jv, num_buses, time_step)
     _set_entries_for_area(data, Jv, time_step)
