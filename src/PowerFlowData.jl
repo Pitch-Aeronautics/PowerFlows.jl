@@ -168,6 +168,9 @@ struct PowerFlowData{
     # Persisted NR/TR symbolic-factorization cache (a `PolarNRCache`, defined in
     # `power_flow_method.jl`); its own slot so it never contends with a DC/FD `solver_cache`.
     polar_nr_cache::Base.RefValue{Union{Nothing, SolverCache}}
+    # The reactive-limit check's PV→PQ releases (each bus's setpoint) and PQ→PV returns; see
+    # `QLimitSwitchState` and `_check_q_limit_bounds!`.
+    q_limit_switches::QLimitSwitchState
 end
 
 # aliases for specific type parameter combinations.
@@ -231,6 +234,12 @@ get_generic_hvdc_flows(pfd::PowerFlowData) = pfd.generic_hvdc_flows
 get_bus_slack_participation_factors(pfd::PowerFlowData) =
     pfd.bus_slack_participation_factors
 get_bus_type(pfd::PowerFlowData) = pfd.bus_type
+"""Number of PQ→PV returns the reactive-limit check has made on `pfd` (a bus released at a
+limit whose voltage crossed to the other side of its setpoint)."""
+get_q_limit_return_count(pfd::PowerFlowData) = pfd.q_limit_switches.returns[]
+"""Indices of the buses that hit the flip-flop cap (`MAX_Q_LIMIT_FLIP_FLOPS`) at `time_step`."""
+get_q_limit_capped_buses(pfd::PowerFlowData, time_step::Int = 1) =
+    sort!([ix for (ix, ts) in pfd.q_limit_switches.capped if ts == time_step])
 get_bus_magnitude(pfd::PowerFlowData) = pfd.bus_magnitude
 get_bus_angles(pfd::PowerFlowData) = pfd.bus_angles
 get_arc_active_power_flow_from_to(pfd::PowerFlowData) =
@@ -451,6 +460,7 @@ function PowerFlowData(
         controlled_devices,
         Base.RefValue{Union{Nothing, ACJacobianStructureCache}}(nothing), # ac_jacobian_structure_cache
         Base.RefValue{Union{Nothing, SolverCache}}(nothing), # polar_nr_cache (lazily populated)
+        QLimitSwitchState(), # q_limit_switches
     )
 end
 

@@ -338,6 +338,7 @@ function _solve_with_q_limits!(
 )
     check_reactive_power_limits = pf.check_reactive_power_limits
     converged = false
+    empty!(data.q_limit_switches.returned_this_loop)
 
     for _ in 1:MAX_REACTIVE_POWER_ITERATIONS
         converged = _newton_power_flow(pf, data, time_step; kwargs...)
@@ -347,12 +348,12 @@ function _solve_with_q_limits!(
         end
     end
 
-    # Iteration cap reached: the last `_check_q_limit_bounds!` flipped one or more PV buses to
-    # PQ (and clamped their Q) without a follow-up solve, so `data`'s voltages no longer match
-    # its bus types. Pin that final PV/PQ assignment and solve once more so the returned state is
-    # self-consistent, then return THAT solve's actual convergence (not a forced `true`) — the
-    # classic "fix-as-PQ after N iterations" resolution, rather than discarding a solution that
-    # does converge.
+    # Iteration cap reached: the last `_check_q_limit_bounds!` switched one or more buses (PV to
+    # PQ with their Q clamped, or PQ back to PV at their setpoint) without a follow-up solve, so
+    # `data`'s voltages no longer match its bus types. Pin that final PV/PQ assignment and solve
+    # once more so the returned state is self-consistent, then return THAT solve's actual
+    # convergence (not a forced `true`) — the classic "fix-as-PQ after N iterations" resolution,
+    # rather than discarding a solution that does converge.
     @warn(
         "reactive power limits still oscillating after $MAX_REACTIVE_POWER_ITERATIONS \
         iterations; pinning the final PV/PQ assignment and solving once more"
@@ -366,6 +367,7 @@ function _ac_power_flow(
     time_step::Int64;
     kwargs...,
 )
+    _reset_q_limit_flip_flops!(data, time_step)
     cd = data.controlled_devices
     if isnothing(cd) || isempty(cd)
         return _solve_with_q_limits!(pf, data, time_step; kwargs...)
@@ -446,31 +448,101 @@ function _ac_power_flow_with_area_relax!(
     return converged
 end
 
+# Each time step's solve starts with no flip-flops counted and no bus capped.
+function _reset_q_limit_flip_flops!(data::ACPowerFlowData, time_step::Int)
+    st = data.q_limit_switches
+    filter!(kv -> kv[1][2] != time_step, st.flip_flops)
+    filter!(k -> k[2] != time_step, st.capped)
+    return
+end
+
+"""
+    _check_q_limit_bounds!(data, time_step) -> Bool
+
+The reactive-limit check after a converged solve, as PSS/E applies it (VARLIM):
+
+- a PV bus whose generation Q is outside its bounds is released to PQ with Q clamped to the
+  violated bound, and the |V| it held (its setpoint) is recorded;
+- a bus released that way returns to PV at its setpoint when its voltage has crossed to the other
+  side: Q at Qmax with |V| above the setpoint, or at Qmin with |V| below it. A unit truly at its
+  limit sits on the near side (at Qmax it cannot hold |V| up to the setpoint) and stays PQ.
+
+Without the return a release is one-way, so a unit pushed past a limit by a transient (a
+discrete-control continuation's early passes) ends at that limit on the wrong side of its
+setpoint. Every inner solve of the continuation runs this check, so the return happens there too,
+before the discrete snap.
+
+The bounds are the bus's (the sum over its units, as for the release), so a multi-unit bus
+switches as one. A unit that regulates a remote bus by IREG (`_generator_remote_bus`) holds its own
+terminal in PowerFlows, so its setpoint here is its terminal's stored |V|, the quantity its PV bus
+holds. A bus with no Q range (Qmin = Qmax) never returns. A return the next solve of the same
+Q-limit loop undoes is a flip-flop; after `MAX_Q_LIMIT_FLIP_FLOPS` in one time step's solve the
+bus stays PQ, with a warning.
+
+Returns `true` when no bus switched.
+"""
 function _check_q_limit_bounds!(
     data::ACPowerFlowData,
     time_step::Int64,
 )
-    bus_names = data.power_network_matrix.axes[1]
+    st = data.q_limit_switches
     within_limits = true
     bus_types = view(data.bus_type, :, time_step)
     for (ix, bt) in enumerate(bus_types)
-        bt != PSY.ACBusTypes.PV && continue
-        Q_gen = data.bus_reactive_power_injections[ix, time_step]
-
-        Q_max = data.bus_reactive_power_bounds[ix, time_step][2]
-        Q_min = data.bus_reactive_power_bounds[ix, time_step][1]
-
-        if !(Q_min - BOUNDS_TOLERANCE <= Q_gen <= Q_max + BOUNDS_TOLERANCE)
-            @info "Bus $(bus_names[ix]) changed to PSY.ACBusTypes.PQ"
-            within_limits = false
-            data.bus_type[ix, time_step] = PSY.ACBusTypes.PQ
-            data.bus_reactive_power_injections[ix, time_step] =
-                clamp(Q_gen, Q_min, Q_max)
-        else
-            @debug "Within Limits"
+        if bt == PSY.ACBusTypes.PV
+            _q_limit_release!(data, st, ix, time_step) && (within_limits = false)
+        elseif bt == PSY.ACBusTypes.PQ
+            _q_limit_return!(data, st, ix, time_step) && (within_limits = false)
         end
     end
     return within_limits
+end
+
+function _q_limit_release!(data::ACPowerFlowData, st::QLimitSwitchState, ix::Int, ts::Int)
+    Q_gen = data.bus_reactive_power_injections[ix, ts]
+    Q_min, Q_max = data.bus_reactive_power_bounds[ix, ts]
+    if Q_min - BOUNDS_TOLERANCE <= Q_gen <= Q_max + BOUNDS_TOLERANCE
+        @debug "Within Limits"
+        return false
+    end
+    bus_name = data.power_network_matrix.axes[1][ix]
+    key = (ix, ts)
+    if key in st.returned_this_loop
+        n = st.flip_flops[key] = get(st.flip_flops, key, 0) + 1
+        if n >= MAX_Q_LIMIT_FLIP_FLOPS && !(key in st.capped)
+            push!(st.capped, key)
+            @warn "Bus $bus_name switched PQ→PV→PQ $n times at time step $ts \
+                (MAX_Q_LIMIT_FLIP_FLOPS); it stays PQ for the rest of this solve"
+        end
+    end
+    @info "Bus $bus_name changed to PSY.ACBusTypes.PQ"
+    st.vset[key] = data.bus_magnitude[ix, ts]
+    data.bus_type[ix, ts] = PSY.ACBusTypes.PQ
+    data.bus_reactive_power_injections[ix, ts] = clamp(Q_gen, Q_min, Q_max)
+    return true
+end
+
+function _q_limit_return!(data::ACPowerFlowData, st::QLimitSwitchState, ix::Int, ts::Int)
+    key = (ix, ts)
+    vset = get(st.vset, key, NaN)
+    (isnan(vset) || key in st.capped) && return false
+    Q_min, Q_max = data.bus_reactive_power_bounds[ix, ts]
+    Q_max - Q_min > BOUNDS_TOLERANCE || return false
+    Q = data.bus_reactive_power_injections[ix, ts]
+    V = data.bus_magnitude[ix, ts]
+    at_max = Q >= Q_max - BOUNDS_TOLERANCE
+    at_min = Q <= Q_min + BOUNDS_TOLERANCE
+    tol = Q_LIMIT_RETURN_VOLTAGE_TOLERANCE
+    ((at_max && V > vset + tol) || (at_min && V < vset - tol)) || return false
+    bus_name = data.power_network_matrix.axes[1][ix]
+    @info "Bus $bus_name changed back to PSY.ACBusTypes.PV: Q at its \
+        $(at_max ? "maximum" : "minimum") with |V| = $V $(at_max ? "above" : "below") its \
+        setpoint $vset"
+    data.bus_type[ix, ts] = PSY.ACBusTypes.PV
+    data.bus_magnitude[ix, ts] = vset
+    push!(st.returned_this_loop, key)
+    st.returns[] += 1
+    return true
 end
 
 function bus_type_idx(

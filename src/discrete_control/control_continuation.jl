@@ -4,8 +4,8 @@
 const CONTROL_CONTRACTION = 0.5
 
 # State a rolled-back trial must restore. `bus_type` is here because the inner solve's Q-limit
-# logic makes one-way PV→PQ flips. An absent VSC or LCC subsystem is carried as empty vectors,
-# which is what the capture/restore guards test.
+# logic switches buses PV→PQ and back (`_check_q_limit_bounds!`). An absent VSC or LCC
+# subsystem is carried as empty vectors, which is what the capture/restore guards test.
 struct ControlStateSnapshot
     vmag::Vector{Float64}
     vang::Vector{Float64}
@@ -191,9 +191,10 @@ mutable struct _SensitivityContext{C, R, JT}
     sol::Vector{Float64}    # J⁻¹·∂F/∂p scratch
     # Snapshot of bus_type at build time. `ACPowerFlowResidual`'s subnetworks/slack-participation
     # factors/validate_indices are computed ONCE at construction from bus_type and are NOT
-    # recomputed by the residual functor — a Q-limit PV→PQ flip elsewhere in the network after
-    # this ctx was built silently stales that structure. `_refresh_sensitivity_context!` checks
-    # this snapshot and rebuilds a ctx whose bus-type pattern has since changed.
+    # recomputed by the residual functor — a Q-limit PV→PQ flip (or PQ→PV return) elsewhere in
+    # the network after this ctx was built silently stales that structure.
+    # `_refresh_sensitivity_context!` checks this snapshot and rebuilds a ctx whose bus-type
+    # pattern has since changed.
     bus_type::Vector{PSY.ACBusTypes}
 end
 
@@ -204,7 +205,7 @@ function _sensitivity_context(pf::ACPolarPowerFlow, data, ts::Int; kwargs...)
     # continuation. `_refresh_sensitivity_context!` re-evaluates VALUES into these same objects
     # on every subsequent batched pass, or rebuilds them after a bus-type change, and does NOT
     # count here: the Jacobian sparsity (and thus the persisted symbolic factorization this
-    # counter tracks) is invariant under the PV→PQ flips that cause a rebuild, so only this one
+    # counter tracks) is invariant under the PV↔PQ switches that cause a rebuild, so only this one
     # build should ever register.
     isnothing(ctx) || _count_symbolic_factor!(data)
     return ctx
@@ -257,8 +258,10 @@ end
 # state (`_rebuild_sensitivity_context!`: a fresh residual and Jacobian, the shared symbolic
 # factorization reused and the pivots refreshed for the new types). Only a singular refactor
 # or rebuild returns `false`, sending the caller to the sequential per-device path. Before, a
-# flip returned `false` here, and since the inner solves' Q-limit flips are one-way every later
-# pass of the continuation ran the per-device path: one full solve per device per pass.
+# flip returned `false` here, and since the inner solves' Q-limit flips were then one-way every
+# later pass of the continuation ran the per-device path: one full solve per device per pass. A
+# PQ→PV return (a released unit whose voltage crossed back past its setpoint) changes the types
+# the same way and is rebuilt the same way.
 #
 # `P_net`/`Q_net`/`P_net_set` and the four constant-I/Z withdrawal vectors are all captured from
 # `data` ONCE at `ACPowerFlowResidual` construction and are NOT independently re-read by the

@@ -28,6 +28,30 @@ discriminates which path populated it — no sentinel tag is needed and a cross-
 `MethodError` rather than a silent reuse."""
 abstract type SolverCache end
 
+"""State of the reactive-limit check's bus-type switches, per `(bus index, time step)`.
+
+- `vset`: the |V| a PV bus held when the check released it to PQ, its setpoint (a PV bus holds
+  its stored magnitude). Only a bus with an entry may return to PV: a bus that is PQ by its data
+  never regulates.
+- `flip_flops`: returns to PV that the next solve of the same Q-limit loop undid, in the current
+  time step's solve; `capped` holds the buses that reached `MAX_Q_LIMIT_FLIP_FLOPS` and stay PQ.
+- `returned_this_loop`: the buses returned to PV in the running Q-limit loop.
+- `returns`: PQ→PV returns over the data's life (a diagnostic)."""
+struct QLimitSwitchState
+    vset::Dict{Tuple{Int, Int}, Float64}
+    flip_flops::Dict{Tuple{Int, Int}, Int}
+    capped::Set{Tuple{Int, Int}}
+    returned_this_loop::Set{Tuple{Int, Int}}
+    returns::Base.RefValue{Int}
+end
+QLimitSwitchState() = QLimitSwitchState(
+    Dict{Tuple{Int, Int}, Float64}(),
+    Dict{Tuple{Int, Int}, Int}(),
+    Set{Tuple{Int, Int}}(),
+    Set{Tuple{Int, Int}}(),
+    Ref(0),
+)
+
 """Memoized AC-Jacobian sparse structure, stored in its OWN `PowerFlowData` field (not the shared
 `solver_cache` slot): the NR/TR AC Jacobian and a [`SolverCache`](@ref) can both be live in one
 solve — e.g. a FastDecoupled solve that hands off to NR uses a `FastDecoupledCache` *and* this

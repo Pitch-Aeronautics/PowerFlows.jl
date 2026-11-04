@@ -233,9 +233,15 @@ end
     _set_multiperiod_shunt_loads!(data, time_steps)
     @test solve_power_flow!(data)
     @test all(data.converged)
-    # The Q-limit mechanism genuinely engaged: the PV bus switched to PQ at some step.
+    # The Q-limit mechanism genuinely engaged: at every step the base solve (before the shunt
+    # acts) drives the unit to Qmax and releases it; once the shunt has raised the voltage past
+    # its setpoint it returns to PV (GAP-027; before, it ended PQ at Qmax with |V| = 1.0016, on
+    # the wrong side of its 1.0 setpoint) and ends inside its limits.
     pv_ix = PF.get_bus_lookup(data)[2]
-    @test any(t -> data.bus_type[pv_ix, t] == PSY.ACBusTypes.PQ, 1:time_steps)
+    @test PF.get_q_limit_return_count(data) >= time_steps
+    @test all(t -> data.bus_type[pv_ix, t] == PSY.ACBusTypes.PV, 1:time_steps)
+    @test all(t -> data.bus_magnitude[pv_ix, t] == 1.0, 1:time_steps)
+    @test all(t -> -0.02 < data.bus_reactive_power_injections[pv_ix, t] < 0.02, 1:time_steps)
     # Gold-standard parity: each step matches an independent single-ts combined-mode solve.
     results = PowerFlows.get_controlled_device_results(data)
     for t in 1:time_steps

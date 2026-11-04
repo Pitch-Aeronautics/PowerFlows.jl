@@ -2,6 +2,13 @@ const MAX_INIT_RESIDUAL = 10.0
 const BOUNDS_TOLERANCE = 1e-6
 const INFINITE_BOUND = 1e6 # used as default when a branch has rating 0.0, as implied by the PSSE Manual
 const MAX_REACTIVE_POWER_ITERATIONS = 10
+# PQ→PV return of a Q-limited bus (PSS/E's rule: a unit at Qmax with |V| above its setpoint, or
+# at Qmin with |V| below it, regulates again). The voltage must be past the setpoint by more than
+# this, so solver noise at a unit sitting on its limit with |V| ≈ Vset does not switch it.
+const Q_LIMIT_RETURN_VOLTAGE_TOLERANCE = 1e-6
+# A return the next solve of the same Q-limit loop undoes (the bus goes back to PQ) is a flip-flop.
+# A bus that flip-flops this many times in one time step's solve stays PQ for the rest of it.
+const MAX_Q_LIMIT_FLIP_FLOPS = 3
 
 # Discrete control device λ-continuation outer loop.
 # Pass budget PER STEEPNESS STAGE (each of the ~7 stages settles independently; one
