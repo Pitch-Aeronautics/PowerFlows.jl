@@ -219,6 +219,20 @@ false` on the power flow restores the earlier behaviour, driving every tap to
 `voltage_setpoint` with no deadband. FACTS devices, and taps without a parsed
 band, carry a point setpoint and always regulate.
 
+**Tap orientation.** Every device is oriented by its measured dy/dp, so the
+loop is negative feedback whatever the wiring. Two refinements for taps:
+parallel taps regulating one bus (same terminals, same regulated bus) whose
+measured signs disagree — each unit's own effect is weak, or a reactive
+current circulates between units at unequal ratios — are aligned to the sign
+of their summed sensitivity, so they move together instead of walking apart
+(a tap fight); their measured magnitudes still size the steps. And
+`tap_direction = :cont_sign` orients a tap by PSS/E's convention for the sign
+of CONT1 instead (`ext["CONT1"]`, or `ext["psse"]["CONT1"]`): positive, the
+ratio is adjusted as if the regulated bus were on the winding-2 side (raising
+the winding-1 ratio lowers it); negative, as if on the winding-1 side. Where
+the convention and the network disagree the tap runs to a limit, as PSS/E's
+would. The default, `:sensitivity`, keeps the measured sign.
+
 **Impedance correction.** A tap transformer with a `TAP_RATIO` impedance
 correction table (`PSY.ImpedanceCorrectionData`) re-evaluates the table's
 factor at every tap the controller applies, so each step is sized on, and the

@@ -374,6 +374,12 @@ with the specified solver type.
     first step inside; a continuous (MODSW 2) shunt ends on the violated edge (PSS/E). `false`
     regulates toward the band midpoint, holds once inside and snaps to the nearest step.
     Default is `true`.
+- `tap_direction::Symbol`: With `control_discrete_devices`, how a voltage-controlling tap is
+    oriented. `:sensitivity` (default) uses the measured dV/dtap, and aligns parallel taps that
+    regulate one bus when they measure opposite signs. `:cont_sign` uses PSS/E's convention for
+    a tap with a signed CONT1 in `ext` (`ext["CONT1"]`, or `ext["psse"]["CONT1"]`): positive
+    as if the regulated bus were on the winding-2 side (raising the ratio lowers its voltage),
+    negative as if on the winding-1 side.
 - `area_interchange_control::Bool`: Whether to embed PSS/E-style per-area net-interchange
     control in the AC solve (polar formulation; NR/TR/LM/FastDecoupled solvers).
     Default is `false`.
@@ -407,6 +413,7 @@ struct ACPolarPowerFlow{ACSolver <: ACPowerFlowSolverType} <: AbstractACPowerFlo
     control_discrete_devices::Bool
     tap_voltage_band::Bool
     shunt_voltage_band::Bool
+    tap_direction::Symbol
     area_interchange_control::Bool
     interchange_tolerance::Float64
     tie_definition::Symbol
@@ -468,6 +475,7 @@ function ACPolarPowerFlow{ACSolver}(;
     control_discrete_devices::Bool = false,
     tap_voltage_band::Bool = true,
     shunt_voltage_band::Bool = true,
+    tap_direction::Symbol = :sensitivity,
     area_interchange_control::Bool = false,
     interchange_tolerance::Float64 = DEFAULT_INTERCHANGE_TOLERANCE,
     tie_definition::Symbol = :lines_only,
@@ -483,6 +491,7 @@ function ACPolarPowerFlow{ACSolver}(;
         time_steps,
     )
     _validate_discrete_control_settings(control_discrete_devices, ACSolver)
+    _validate_tap_direction(tap_direction)
     validated_interchange_tolerance = _validate_area_interchange_settings(
         ACSolver,
         area_interchange_control,
@@ -507,6 +516,7 @@ function ACPolarPowerFlow{ACSolver}(;
         control_discrete_devices,
         tap_voltage_band,
         shunt_voltage_band,
+        tap_direction,
         area_interchange_control,
         validated_interchange_tolerance,
         tie_definition,
@@ -552,6 +562,8 @@ get_tap_voltage_band(pf::AbstractACPowerFlow) = pf.tap_voltage_band
 get_tap_voltage_band(::PowerFlowEvaluationModel) = true
 get_shunt_voltage_band(pf::AbstractACPowerFlow) = pf.shunt_voltage_band
 get_shunt_voltage_band(::PowerFlowEvaluationModel) = true
+get_tap_direction(pf::AbstractACPowerFlow) = pf.tap_direction
+get_tap_direction(::PowerFlowEvaluationModel) = :sensitivity
 
 get_area_interchange_control(pf::AbstractACPowerFlow) = pf.area_interchange_control
 get_area_interchange_control(::PowerFlowEvaluationModel) = false
@@ -605,6 +617,8 @@ polar state layout and have no current-injection equivalent.
     band `[VSWLO, VSWHI]` and step one outside it toward the band, stopping at the first step
     inside (PSS/E); `false` is the band-midpoint rule. See [`ACPolarPowerFlow`](@ref).
     Default `true`.
+- `tap_direction::Symbol`: `:sensitivity` (default) or `:cont_sign` (PSS/E's CONT1 sign
+    convention). See [`ACPolarPowerFlow`](@ref).
 - `area_interchange_control::Bool`: Not supported on this formulation (area interchange control is polar-only);
     passing `true` throws `ArgumentError`. Default `false`.
 - `solver_settings::Dict{Symbol, Any}`: Default empty.
@@ -629,6 +643,7 @@ struct ACRectangularPowerFlow{ACSolver <: ACPowerFlowSolverType} <:
     control_discrete_devices::Bool
     tap_voltage_band::Bool
     shunt_voltage_band::Bool
+    tap_direction::Symbol
     area_interchange_control::Bool
     interchange_tolerance::Float64
     tie_definition::Symbol
@@ -654,6 +669,7 @@ function ACRectangularPowerFlow{ACSolver}(;
     control_discrete_devices::Bool = false,
     tap_voltage_band::Bool = true,
     shunt_voltage_band::Bool = true,
+    tap_direction::Symbol = :sensitivity,
     area_interchange_control::Bool = false,
     interchange_tolerance::Float64 = DEFAULT_INTERCHANGE_TOLERANCE,
     tie_definition::Symbol = :lines_only,
@@ -684,6 +700,7 @@ function ACRectangularPowerFlow{ACSolver}(;
         time_steps,
     )
     _validate_discrete_control_settings(control_discrete_devices, ACSolver)
+    _validate_tap_direction(tap_direction)
     return ACRectangularPowerFlow{ACSolver}(
         check_reactive_power_limits,
         exporter,
@@ -699,6 +716,7 @@ function ACRectangularPowerFlow{ACSolver}(;
         control_discrete_devices,
         tap_voltage_band,
         shunt_voltage_band,
+        tap_direction,
         area_interchange_control,
         interchange_tolerance,
         tie_definition,
@@ -754,6 +772,8 @@ polar state layout and have no mixed current-power equivalent.
     band `[VSWLO, VSWHI]` and step one outside it toward the band, stopping at the first step
     inside (PSS/E); `false` is the band-midpoint rule. See [`ACPolarPowerFlow`](@ref).
     Default `true`.
+- `tap_direction::Symbol`: `:sensitivity` (default) or `:cont_sign` (PSS/E's CONT1 sign
+    convention). See [`ACPolarPowerFlow`](@ref).
 - `area_interchange_control::Bool`: Not supported on this formulation (area interchange control is polar-only);
     passing `true` throws `ArgumentError`. Default `false`.
 - `solver_settings::Dict{Symbol, Any}`: Default empty.
@@ -778,6 +798,7 @@ struct ACMixedPowerFlow{ACSolver <: ACPowerFlowSolverType} <:
     control_discrete_devices::Bool
     tap_voltage_band::Bool
     shunt_voltage_band::Bool
+    tap_direction::Symbol
     area_interchange_control::Bool
     interchange_tolerance::Float64
     tie_definition::Symbol
@@ -803,6 +824,7 @@ function ACMixedPowerFlow{ACSolver}(;
     control_discrete_devices::Bool = false,
     tap_voltage_band::Bool = true,
     shunt_voltage_band::Bool = true,
+    tap_direction::Symbol = :sensitivity,
     area_interchange_control::Bool = false,
     interchange_tolerance::Float64 = DEFAULT_INTERCHANGE_TOLERANCE,
     tie_definition::Symbol = :lines_only,
@@ -831,6 +853,7 @@ function ACMixedPowerFlow{ACSolver}(;
         time_steps,
     )
     _validate_discrete_control_settings(control_discrete_devices, ACSolver)
+    _validate_tap_direction(tap_direction)
     return ACMixedPowerFlow{ACSolver}(
         check_reactive_power_limits,
         exporter,
@@ -846,6 +869,7 @@ function ACMixedPowerFlow{ACSolver}(;
         control_discrete_devices,
         tap_voltage_band,
         shunt_voltage_band,
+        tap_direction,
         area_interchange_control,
         interchange_tolerance,
         tie_definition,

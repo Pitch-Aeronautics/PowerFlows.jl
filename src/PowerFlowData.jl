@@ -642,6 +642,7 @@ function _build_controlled_devices(
         n_time_steps = n_time_steps,
         tap_voltage_band = get_tap_voltage_band(pf),
         shunt_voltage_band = get_shunt_voltage_band(pf),
+        tap_direction = get_tap_direction(pf),
     )
     if isempty(set)
         return nothing

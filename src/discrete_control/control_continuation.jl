@@ -528,6 +528,10 @@ end
 function _apply_gain_refresh!(d, idx::Int, data, ts::Int, frozen::Vector{Bool},
     dVdp::Vector{Float64}, dv::Float64, g::Float64)
     lo, hi = parameter_limits(d)
+    # A device whose orientation is imposed (PSS/E CONT sign, or a parallel group's alignment)
+    # takes only the measured magnitude: its own measured sign may legitimately oppose it.
+    f = _forced_sign(d)
+    iszero(f) || (g = f * abs(g))
     if !iszero(dv) && !iszero(g) && sign(g) != sign(dv)
         _freeze_device!(frozen, idx, d, ts,
             "plant sensitivity changed sign along the trajectory (reverse action); \
@@ -620,10 +624,50 @@ function _probe_device_signs!(
         s, reliable = _probe_one_sign(d, data, ts, pf, scratch_snap, ctx; kwargs...)
         lo, hi = parameter_limits(d)
         if reliable && abs(s) * (hi - lo) >= CONTROL_GAIN_FLOOR
-            dVdp[offset + i] = s
+            f = _forced_sign(d)
+            dVdp[offset + i] = iszero(f) ? s : f * abs(s)
         else
             frozen[offset + i] = true
         end
+    end
+    return
+end
+
+# Parallel taps regulating one bus (the same controlled bus and the same pair of terminal
+# buses) are one control: PSS/E moves such units the same way. Measured one at a time their
+# dV/dp can disagree in sign where each unit's own effect is weak (a tap regulating its own
+# winding-1 bus, or units at unequal ratios with a circulating current between them), and the
+# continuation then walks them apart, each "helping" its bus through the circulating current: a
+# tap fight. When the members' signs disagree (taken in a common arc orientation: a member
+# whose arc is reversed counts with its sign flipped), each member whose orientation is not
+# fixed by `tap_direction = :cont_sign` is aligned to the sign of the members' summed
+# sensitivity, the effect of moving them together; its measured magnitude still sizes its
+# steps (`aligned`, see `_forced_sign`). Agreeing groups are untouched.
+function _align_parallel_taps!(taps::Vector{ControlledTap}, dVdp::Vector{Float64},
+    frozen::Vector{Bool})
+    length(taps) < 2 && return
+    groups = Dict{NTuple{3, Int}, Vector{Int}}()
+    for (i, d) in enumerate(taps)
+        frozen[i] && continue
+        key = (d.controlled_ix, minmax(d.from_ix, d.to_ix)...)
+        push!(get!(groups, key, Int[]), i)
+    end
+    for members in values(groups)
+        length(members) < 2 && continue
+        orient(i) = taps[i].from_ix < taps[i].to_ix ? 1 : -1
+        signs = [sign(dVdp[i]) * orient(i) for i in members]
+        all(==(signs[1]), signs) && continue
+        total = sum(dVdp[i] * orient(i) for i in members)
+        iszero(total) && continue
+        for i in members
+            d = taps[i]
+            iszero(d.orientation) || continue
+            d.aligned = Int(sign(total)) * orient(i)
+            dVdp[i] = d.aligned * abs(dVdp[i])
+        end
+        names = join((taps[i].name for i in members), ", ")
+        @debug "discrete control: parallel taps $names measured opposite dV/dtap signs; \
+            aligned to their joint effect."
     end
     return
 end
@@ -840,6 +884,7 @@ function _control_continuation!(
     for d in set.taps
         d.side = 0
         d.anchor = d.current
+        d.aligned = 0
     end
     for d in set.shunts
         d.side = 0
@@ -887,6 +932,7 @@ function _control_continuation!(
         scratch_snap;
         kwargs...,
     )
+    _align_parallel_taps!(set.taps, dVdp, frozen)
     _probe_device_signs!(
         set.shunts, n_taps, dVdp, frozen, ctx, data, ts, pf, scratch_snap; kwargs...)
     _probe_device_signs!(

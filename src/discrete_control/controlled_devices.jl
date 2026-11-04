@@ -20,7 +20,14 @@ voltage lies in `[v_lo, v_hi]`, and one outside the band regulates toward the vi
 and stops at the first discrete step inside it (see `_update_band_state!`, `snap_to_discrete`
 and `_band_settle!`). `side` is the latched violation (−1 below `v_lo`, +1 above `v_hi`, 0 not
 regulating) and `anchor` the tap where it latched; both are continuation scratch, reset at the
-start of every `_control_continuation!`. Without a band the tap is driven to `vset`."""
+start of every `_control_continuation!`. Without a band the tap is driven to `vset`.
+
+Orientation: the continuation orients a tap by its measured dV/dp. With `orientation` ±1
+(`tap_direction = :cont_sign`, from the sign of PSS/E's CONT1) the sign of dV/dp is fixed
+instead, as PSS/E adjusts the ratio: CONT1 > 0 as if the regulated bus were on the winding-2
+(to) side, so raising the ratio lowers its voltage (−1); CONT1 < 0 as if on the winding-1
+(from) side (+1). The measured magnitude still sizes each step. `aligned` is set when parallel
+taps regulating one bus measure opposite signs (see `_align_parallel_taps!`)."""
 mutable struct ControlledTap <: AbstractBranchControl
     name::String
     from_ix::Int
@@ -42,9 +49,12 @@ mutable struct ControlledTap <: AbstractBranchControl
     v_hi::Float64                    # VMA1
     side::Int                        # latched violation: −1 below, +1 above, 0 none
     anchor::Float64                  # tap where the current latch began
+    orientation::Int                 # sign of dV/dp fixed by PSS/E's CONT sign; 0 ⇒ measured
+    aligned::Int                     # continuation scratch: sign a parallel group imposed
 end
 
-# Positional forms without the newer fields: no impedance correction table, point setpoint.
+# Positional forms without the newer fields: no impedance correction table, point setpoint,
+# orientation by measured sensitivity.
 ControlledTap(
     name, from_ix, to_ix, controlled_ix, vset, yt, alpha, p_min, p_max, levels, nz_offsets,
     initial, synced, current, correction = nothing,
@@ -52,6 +62,19 @@ ControlledTap(
     name, from_ix, to_ix, controlled_ix, vset, yt, alpha, p_min, p_max, levels, nz_offsets,
     initial, synced, current, correction, false, vset, vset, 0, current,
 )
+ControlledTap(
+    name, from_ix, to_ix, controlled_ix, vset, yt, alpha, p_min, p_max, levels, nz_offsets,
+    initial, synced, current, correction, band, v_lo, v_hi, side, anchor,
+) = ControlledTap(
+    name, from_ix, to_ix, controlled_ix, vset, yt, alpha, p_min, p_max, levels, nz_offsets,
+    initial, synced, current, correction, band, v_lo, v_hi, side, anchor, 0, 0,
+)
+
+"""The sign of dV/dp the continuation must use for device `d`, or 0 to use the measured one:
+a tap's PSS/E CONT-sign orientation (`tap_direction = :cont_sign`), else the sign its parallel
+group was aligned to (`_align_parallel_taps!`)."""
+_forced_sign(::AbstractControlledDevice) = 0
+_forced_sign(d::ControlledTap) = iszero(d.orientation) ? d.aligned : d.orientation
 
 """Slope of PNM's correction-table interpolation (`PNM._interpolate_correction_factor`) at
 `x`: the slope of the segment that interpolation uses there, and zero outside the table (the

@@ -167,6 +167,42 @@ function _shunt_susceptance_model(
     return b_fixed, current, b_min, b_max
 end
 
+const TAP_DIRECTIONS = (:sensitivity, :cont_sign)
+
+function _validate_tap_direction(tap_direction::Symbol)
+    tap_direction in TAP_DIRECTIONS || throw(
+        ArgumentError(
+            "tap_direction must be one of $(TAP_DIRECTIONS); got :$tap_direction",
+        ),
+    )
+    return
+end
+
+"""The signed PSS/E CONT1 of a `TapTransformer`: `ext["CONT1"]` (the PSS/E parser keeps it,
+sign included, while `regulated_bus_number` holds its magnitude) or `ext["psse"]["CONT1"]`;
+`nothing` when absent or zero."""
+function _tap_cont1(tx)
+    ext = PSY.get_ext(tx)
+    c = get(ext, "CONT1", nothing)
+    if !(c isa Real)
+        psse = get(ext, "psse", nothing)
+        c = psse isa AbstractDict ? get(psse, "CONT1", nothing) : nothing
+    end
+    (c isa Real && !iszero(c)) || return nothing
+    return c
+end
+
+"""Orientation of a tap under PSS/E's CONT sign convention (PSS/E raw-data notes on CONT1: a
+positive CONT1 adjusts the ratio as if the controlled bus were on the winding-2 side, a
+negative one as if it were on the winding-1 side). The tap ratio is the winding-1 (`from`)
+ratio, so on the winding-2 side raising it lowers the voltage (−1), on the winding-1 side it
+raises it (+1). 0 (orient by measured sensitivity) without a CONT1."""
+function _tap_cont_orientation(tx)
+    c = _tap_cont1(tx)
+    isnothing(c) && return 0
+    return c > 0 ? -1 : 1
+end
+
 """PSS/E `ADJM` of a switched shunt (`ext`, from the PSS/E parser): 1 switches to the next
 higher or lower total admittance, 0 (the default, and for API-built shunts) in input order."""
 function _shunt_adjm(sa)
@@ -214,7 +250,12 @@ shunt and its `[VSWLO, VSWHI]` band (`admittance_limits`): held inside, stepped 
 toward the band when outside, stopping at the first step inside (a continuous MODSW 2 shunt
 ends on the violated edge), with the blocks in PSS/E's order (`ext["ADJM"]`, see
 [`_shunt_levels`](@ref)). `false` is the rule before: regulate toward the band midpoint, hold
-once inside, snap to the nearest step of the input-order chains."""
+once inside, snap to the nearest step of the input-order chains.
+
+`tap_direction = :sensitivity` (the default) orients every tap by its measured dV/dp, with
+parallel taps regulating one bus aligned when they measure opposite signs (see
+`_align_parallel_taps!`). `:cont_sign` orients a tap with a signed CONT1 in `ext` by PSS/E's
+convention instead (see `_tap_cont_orientation`); taps without one stay on the measured sign."""
 function build_controlled_device_set(
     sys,
     bus_lookup::Dict{Int, Int},
@@ -223,7 +264,9 @@ function build_controlled_device_set(
     n_time_steps::Int = 1,
     tap_voltage_band::Bool = true,
     shunt_voltage_band::Bool = true,
+    tap_direction::Symbol = :sensitivity,
 )
+    _validate_tap_direction(tap_direction)
     taps = ControlledTap[]
     correction_tables = _tap_correction_tables(sys)
     for tx in PSY.get_available_components(PSY.TapTransformer, sys)
@@ -291,6 +334,8 @@ function build_controlled_device_set(
                 v_hi,
                 0,      # side (continuation scratch)
                 tap0,   # anchor (continuation scratch)
+                tap_direction == :cont_sign ? _tap_cont_orientation(tx) : 0,
+                0,      # aligned (continuation scratch)
             ),
         )
     end
