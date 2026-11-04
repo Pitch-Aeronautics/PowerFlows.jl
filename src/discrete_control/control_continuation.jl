@@ -1045,7 +1045,7 @@ function _control_continuation!(
             MAX_CONTROL_PASSES_PER_STAGE=$(MAX_CONTROL_PASSES_PER_STAGE) passes \
             (S=$S); regulation may be loose at time step $ts"
     end
-    ok = snap_and_restore!(pf, data, set, ts, scratch_snap; kwargs...)
+    ok = snap_and_restore!(pf, data, set, ts, scratch_snap, dVdp; kwargs...)
     # Regulating continuous devices (shunts, FACTS) end on their target exactly, or at a limit.
     ok && _continuous_finish!(pf, data, set, ts, scratch_snap, frozen, dVdp, n_shared,
         n_taps; kwargs...)
@@ -1268,7 +1268,8 @@ end
 # once. A failed solve rolls the round back and ends the walk at the last converged state, with
 # a warning.
 function _band_settle!(
-    pf, data, set::ControlledDeviceSet, ts::Int, snap::ControlStateSnapshot; kwargs...,
+    pf, data, set::ControlledDeviceSet, ts::Int, snap::ControlStateSnapshot,
+    dVdp::Union{Nothing, Vector{Float64}} = nothing; kwargs...,
 )
     (any(_band_latched, set.taps) || any(_band_latched, set.shunts)) || return
     n_taps = length(set.taps)
@@ -1284,7 +1285,8 @@ function _band_settle!(
         Float64[d.current for d in set.shunts])
     for _ in 1:CONTROL_BAND_SETTLE_SWEEPS
         before = positions()
-        _band_back_off!(pf, data, set, ts, snap, prev, moved, rounds; kwargs...) || return
+        _band_back_off!(pf, data, set, ts, snap, prev, moved, rounds, dVdp; kwargs...) ||
+            return
         _band_forward!(pf, data, set, ts, snap, prev, moved, rounds; kwargs...) || return
         positions() == before && return
     end
@@ -1388,15 +1390,35 @@ function _band_revert_group!(devices, offset::Int, data, ts::Int, prev, moved, a
     return reverted
 end
 
-# Whether any latched banded device (tap or discrete shunt) is outside its band on its side.
-function _any_latched_outside(set::ControlledDeviceSet, data, ts::Int)
-    for d in set.taps
-        _band_latched(d) && _outside_latched_side(d, measured_value(d, data, ts)) &&
-            return true
+# Whether a latched device has a level left in the direction that moves its voltage back toward
+# its band. A discrete shunt raises its voltage by stepping up (dV/db > 0), so one below its band
+# needs a level above; a tap's direction is −side·sign(dV/dtap), from the continuation's gain
+# `g` (without one, `nothing` or 0, it counts as able, the rule before). A device railed with no
+# such level stays outside its band whatever the others do; PSS/E accepts it there.
+_can_correct(d::ControlledSwitchedShunt, ::Union{Nothing, Float64}) =
+    !isnothing(_next_level(d, -d.side))
+function _can_correct(d::ControlledTap, g::Union{Nothing, Float64})
+    (isnothing(g) || iszero(g)) && return true
+    return !isnothing(_next_level(d, -d.side * Int(sign(g))))
+end
+_settle_gain(dVdp::Nothing, ::Int) = nothing
+_settle_gain(dVdp::Vector{Float64}, idx::Int) = dVdp[idx]
+
+# Whether a latched device is outside its band on its side and could step back toward it.
+_correctable_outside(d, data, ts::Int, g) =
+    _band_latched(d) && _outside_latched_side(d, measured_value(d, data, ts)) &&
+    _can_correct(d, g)
+
+# Whether any latched banded device (tap or discrete shunt) that can still correct is outside its
+# band on its side (GAP-030: a railed reactor 1.4e-4 below its band, with no level left upward,
+# used to veto every other device's back-off). `dVdp` is indexed [taps; shunts; …].
+function _any_latched_outside(set::ControlledDeviceSet, data, ts::Int, dVdp = nothing)
+    for (i, d) in enumerate(set.taps)
+        _correctable_outside(d, data, ts, _settle_gain(dVdp, i)) && return true
     end
-    for d in set.shunts
-        _band_latched(d) && _outside_latched_side(d, measured_value(d, data, ts)) &&
-            return true
+    n_taps = length(set.taps)
+    for (i, d) in enumerate(set.shunts)
+        _correctable_outside(d, data, ts, _settle_gain(dVdp, n_taps + i)) && return true
     end
     return false
 end
@@ -1405,8 +1427,8 @@ end
 # solve, and keeps the step while every latched device stays inside its band; otherwise it
 # returns (the state is restored, no extra solve) and is done. Returns whether any device
 # stepped back.
-function _band_solo_group!(pf, data, set, devices, offset::Int, ts::Int, snap, retry;
-    kwargs...)
+function _band_solo_group!(pf, data, set, devices, offset::Int, ts::Int, snap, retry,
+    dVdp = nothing; kwargs...)
     stepped = false
     for (i, d) in enumerate(devices)
         idx = offset + i
@@ -1421,7 +1443,8 @@ function _band_solo_group!(pf, data, set, devices, offset::Int, ts::Int, snap, r
         p0 = d.current
         _capture_state!(snap, data, ts)
         _band_apply!(d, data, back, ts)
-        if _ctrl_solve!(pf, data, ts; kwargs...) && !_any_latched_outside(set, data, ts)
+        if _ctrl_solve!(pf, data, ts; kwargs...) &&
+           !_any_latched_outside(set, data, ts, dVdp)
             stepped = true
             continue
         end
@@ -1432,22 +1455,21 @@ function _band_solo_group!(pf, data, set, devices, offset::Int, ts::Int, snap, r
     return stepped
 end
 
-function _unmoved_pushed_out(set::ControlledDeviceSet, data, ts::Int, moved)
+function _unmoved_pushed_out(set::ControlledDeviceSet, data, ts::Int, moved, dVdp = nothing)
     for (i, d) in enumerate(set.taps)
         moved[i] && continue
-        _band_latched(d) && _outside_latched_side(d, measured_value(d, data, ts)) &&
-            return true
+        _correctable_outside(d, data, ts, _settle_gain(dVdp, i)) && return true
     end
     n_taps = length(set.taps)
     for (i, d) in enumerate(set.shunts)
         moved[n_taps + i] && continue
-        _band_latched(d) && _outside_latched_side(d, measured_value(d, data, ts)) &&
-            return true
+        _correctable_outside(d, data, ts, _settle_gain(dVdp, n_taps + i)) && return true
     end
     return false
 end
 
-function _band_back_off!(pf, data, set, ts, snap, prev, moved, rounds; kwargs...)
+function _band_back_off!(pf, data, set, ts, snap, prev, moved, rounds, dVdp = nothing;
+    kwargs...)
     n_taps = length(set.taps)
     active = vcat(
         [_band_latched(d) && !iszero(_band_direction(d)) for d in set.taps],
@@ -1462,7 +1484,7 @@ function _band_back_off!(pf, data, set, ts, snap, prev, moved, rounds; kwargs...
         any(moved) || break
         _ctrl_solve!(pf, data, ts; kwargs...) ||
             return _band_round_failed!(data, set, ts, snap, prev, moved)
-        if _unmoved_pushed_out(set, data, ts, moved)
+        if _unmoved_pushed_out(set, data, ts, moved, dVdp)
             # The joint step pushed a device that did not move out of its band: undo the round
             # (the captured state is exact) and leave its devices to the solo retries.
             _band_undo_group!(set.taps, 0, data, ts, prev, moved)
@@ -1488,9 +1510,10 @@ function _band_back_off!(pf, data, set, ts, snap, prev, moved, rounds; kwargs...
     # alone, so every device ends at its first position inside given where the others are.
     for _ in 1:rounds
         any(retry) || break
-        stepped = _band_solo_group!(pf, data, set, set.taps, 0, ts, snap, retry; kwargs...)
-        stepped |= _band_solo_group!(pf, data, set, set.shunts, n_taps, ts, snap, retry;
+        stepped = _band_solo_group!(pf, data, set, set.taps, 0, ts, snap, retry, dVdp;
             kwargs...)
+        stepped |= _band_solo_group!(pf, data, set, set.shunts, n_taps, ts, snap, retry,
+            dVdp; kwargs...)
         stepped || break
     end
     return true
@@ -1501,7 +1524,8 @@ function snap_and_restore!(
     data,
     set::ControlledDeviceSet,
     ts::Int,
-    scratch_snap::ControlStateSnapshot;
+    scratch_snap::ControlStateSnapshot,
+    dVdp::Union{Nothing, Vector{Float64}} = nothing;
     kwargs...,
 )::Bool
     # Last continuous converged state: the restore path must start from here, not from
@@ -1513,7 +1537,7 @@ function snap_and_restore!(
     cont_shunts = _snap_device_group!(set.shunts, data, ts)
     cont_facts = _snap_device_group!(set.facts, data, ts)
     if _ctrl_solve!(pf, data, ts; kwargs...)
-        _band_settle!(pf, data, set, ts, scratch_snap; kwargs...)
+        _band_settle!(pf, data, set, ts, scratch_snap, dVdp; kwargs...)
         return true
     end
     _restore_state!(data, ts, pre)

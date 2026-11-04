@@ -2066,3 +2066,87 @@ end
     @test vset - δ - 1e-6 <= v <= vset + δ + 1e-6
     @test min(abs(v - (vset - δ)), abs(v - (vset + δ))) < 1e-6
 end
+
+# ── Band settle beside a railed shunt (GAP-030) ─────────────────────────────────────────────
+# REF(1) ─ X(2) ─ Y(3), loads at X and Y. Discrete (MODSW 1) shunts: capacitor A at X, one
+# 0.1 p.u. block, and B at Y, a reactor whose blocks `b_blocks` (one −0.5 p.u. block: levels
+# −0.5 and 0) sit at 0. Bands are set from solved voltages: A is inside its band at 0 and at
+# one block; B is below its band either way.
+function _railed_neighbour_system(; a_binit = 0.0, b_blocks = [-0.5],
+    a_band = (0.5, 1.5), b_band = (0.5, 1.5))
+    sys = System(100.0)
+    b1 = _add_simple_bus!(sys, 1, ACBusTypes.REF, 230, 1.0, 0.0)
+    _add_simple_source!(sys, b1, 0.0, 0.0)
+    bx = _add_simple_bus!(sys, 2, ACBusTypes.PQ, 230, 1.0, 0.0)
+    by = _add_simple_bus!(sys, 3, ACBusTypes.PQ, 230, 1.0, 0.0)
+    _add_simple_line!(sys, b1, bx, 0.01, 0.15, 0.0)
+    _add_simple_line!(sys, bx, by, 0.01, 0.05, 0.0)
+    _add_simple_load!(sys, bx, 20.0, 15.0)
+    _add_simple_load!(sys, by, 20.0, 15.0)
+    for (nm, bus, binit, dB, band) in (("A", bx, a_binit, [0.1], a_band),
+        ("B", by, 0.0, b_blocks, b_band))
+        add_component!(sys, SwitchedAdmittance(; name = nm, available = true, bus = bus,
+            Y = binit * im, initial_status = zeros(Int, length(dB)),
+            number_of_steps = ones(Int, length(dB)), Y_increase = dB .* im,
+            admittance_limits = (min = band[1], max = band[2]),
+            control_mode = PSY.SwitchedAdmittanceControlMode.DISCRETE_VOLTAGE,
+            regulated_bus_number = 0, ext = Dict{String, Any}("MODSW" => 1, "ADJM" => 0)))
+    end
+    return sys
+end
+
+function _railed_neighbour_voltages(a_binit)
+    data = PowerFlowData(ACPolarPowerFlow(), _railed_neighbour_system(; a_binit = a_binit))
+    @test solve_power_flow!(data)
+    bl = PF.get_bus_lookup(data)
+    return data.bus_magnitude[bl[2], 1], data.bus_magnitude[bl[3], 1]
+end
+
+# A latched below its band at one block above its anchor 0 (as the continuation leaves it),
+# B latched below its band at 0; then the band settle after a converged solve.
+function _railed_neighbour_settle(b_blocks)
+    vx0, _ = _railed_neighbour_voltages(0.0)
+    vx1, vy1 = _railed_neighbour_voltages(0.1)
+    @test vx1 > vx0
+    pf = ACPolarPowerFlow(; control_discrete_devices = true)
+    sys = _railed_neighbour_system(; b_blocks = b_blocks,
+        a_band = (vx0 - 0.005, vx1 + 0.02), b_band = (vy1 + 1e-3, vy1 + 0.03))
+    data = PowerFlowData(pf, sys)
+    set = PF.get_controlled_devices(data)
+    sh = Dict(d.name => d for d in set.shunts)
+    a, b = sh["A"], sh["B"]
+    PowerFlows._band_apply!(a, data, 0.1, 1)
+    a.side, a.anchor = -1, 0.0
+    b.side, b.anchor = -1, 0.0
+    @test PowerFlows._solve_with_q_limits!(pf, data, 1)
+    @test PowerFlows._outside_latched_side(b, PowerFlows.measured_value(b, data, 1))
+    PowerFlows._band_settle!(pf, data, set, 1, PowerFlows._snapshot_state(data, 1))
+    va = PowerFlows.measured_value(a, data, 1)
+    return a, b, va
+end
+
+@testset "shunt band: a railed neighbour outside its band does not block a back-off (GAP-030)" begin
+    # B has no level above 0: it cannot raise its voltage, so A steps back to its anchor, the
+    # first position inside its band.
+    a, b, va = _railed_neighbour_settle([-0.5])
+    @test isnothing(PowerFlows._next_level(b, 1))
+    @test a.current == 0.0
+    @test a.vset_lo <= va <= a.vset_hi
+    @test b.current == 0.0
+    # B with a capacitor block above 0 could still correct, and A's step back lowers its
+    # voltage: the back-off is reverted, as before.
+    a, b, _ = _railed_neighbour_settle([-0.5, 0.1])
+    @test !isnothing(PowerFlows._next_level(b, 1))
+    @test a.current == 0.1
+end
+
+@testset "band settle: which latched devices can still correct (GAP-030, unit)" begin
+    levels = collect(range(0.9, 1.1; length = 33))
+    t = PowerFlows.ControlledTap("t", 1, 2, 2, 1.0, 1.0 / (0.01 + 0.1im), 0.0, 0.9, 1.1,
+        levels, (1, 1, 1, 1), 1.1, 1.1, 1.1, nothing, true, 0.97, 1.03, -1, 1.1)
+    # Below its band at the top tap: with dV/dtap > 0 it would need to go up, with < 0 down.
+    @test !PowerFlows._can_correct(t, 0.5)
+    @test PowerFlows._can_correct(t, -0.5)
+    @test PowerFlows._can_correct(t, nothing)          # no gain: counted, the rule before
+    @test PowerFlows._can_correct(t, 0.0)
+end
