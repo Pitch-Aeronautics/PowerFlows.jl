@@ -196,7 +196,8 @@ function _sensitivity_context(pf::ACPolarPowerFlow, data, ts::Int; kwargs...)
     J = ACPowerFlowJacobian(residual, ts)
     J(ts)                                 # Jacobian values at current state
     lin_cache =
-        _nr_linear_solver_cache!(data, J, backend, residual.bus_slack_participation_factors)
+        _nr_linear_solver_cache!(
+            data, J, backend, residual.bus_slack_participation_factors, ts)
     try
         numeric_refactor!(lin_cache, J.Jv)
     catch e

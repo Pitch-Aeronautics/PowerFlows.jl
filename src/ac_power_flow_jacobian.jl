@@ -115,13 +115,21 @@ J.Jv  # Access the Jacobian matrix stored internally in J.
 # so each `ACPowerFlowJacobian` owns a fresh mutable buffer, or `nothing` to signal a rebuild. Lives
 # in its own `data.ac_jacobian_structure_cache` field ([`ACJacobianStructureCache`](@ref)) so it
 # never collides with the FastDecoupled/DC caches in `data.solver_cache[]`.
-_reuse_ac_jac_structure(::Nothing, matrix, nzind, area_data) = nothing
-_reuse_ac_jac_structure(e::ACJacobianStructureCache, matrix, nzind, area_data) =
-    if e.matrix === matrix && e.nzind == nzind && e.area_data === area_data
+# A PV↔PQ flip leaves the structure unchanged; a REF row added or removed, or a new subnetwork
+# (an island given a swing), does not, so those are in the key too.
+_reuse_ac_jac_structure(::Nothing, matrix, nzind, area_data, ref_rows, subnetworks) = nothing
+_reuse_ac_jac_structure(
+    e::ACJacobianStructureCache, matrix, nzind, area_data, ref_rows, subnetworks,
+) =
+    if e.matrix === matrix && e.nzind == nzind && e.area_data === area_data &&
+       e.ref_rows == ref_rows && e.subnetworks == subnetworks
         copy(e.structure)
     else
         nothing
     end
+
+_ref_rows(data::ACPowerFlowData, time_step::Int64) =
+    BitVector(view(data.bus_type, :, time_step) .== (PSY.ACBusTypes.REF,))
 
 function _get_or_build_jacobian_structure(
     data::ACPowerFlowData,
@@ -130,9 +138,10 @@ function _get_or_build_jacobian_structure(
     time_step::Int64,
 )
     nzind = SparseArrays.nonzeroinds(slack_factors)
+    ref_rows = _ref_rows(data, time_step)
     reused = _reuse_ac_jac_structure(
         data.ac_jacobian_structure_cache[], data.power_network_matrix, nzind,
-        data.area_interchange)
+        data.area_interchange, ref_rows, subnetworks)
     isnothing(reused) || return reused
     Jv0 = _create_jacobian_matrix_structure(data, slack_factors, subnetworks, time_step)
     # Cache a pristine copy; `Jv0` is about to be mutated by the Newton loop. `area_data`
@@ -141,7 +150,8 @@ function _get_or_build_jacobian_structure(
     # reuse still works.
     data.ac_jacobian_structure_cache[] =
         ACJacobianStructureCache(
-            data.power_network_matrix, copy(nzind), copy(Jv0), data.area_interchange)
+            data.power_network_matrix, copy(nzind), copy(Jv0), data.area_interchange,
+            ref_rows, deepcopy(subnetworks))
     return Jv0
 end
 

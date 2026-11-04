@@ -977,11 +977,22 @@ end
 # PV↔PQ flips (as `ACJacobianStructureCache` relies on), so symbolic analysis runs once and
 # `numeric_refactor!` refreshes values. Keyed on network-matrix identity + slack nonzero pattern
 # + backend type; an in-place tap/PAR Y-bus edit keeps identity, so the cache correctly survives it.
+#
+# The numeric refactor (`klu_refactor`) reuses the pivot sequence of the last pivoting
+# factorization. A bus-type change (a dropped island's rows turned REF, a new swing, a PV bus
+# turned PQ by an outage) changes which Jacobian entries carry the large values, so a pivot
+# sequence chosen under the old types can be numerically useless and NR stalls (it also did
+# across the time steps of one multiperiod solve when they differ in types). `bus_types` is the
+# bus-type column of the time step that sequence was chosen for: when the column being solved
+# differs, the numeric factor is dropped (symbolic kept), so the next `numeric_refactor!`
+# repivots (`_refresh_pivots!`). A PV→PQ flip in the Q-limit loop therefore costs one pivoting
+# factorization, not a symbolic analysis.
 struct PolarNRCache{M, B, C} <: SolverCache
     matrix::M
     nzind::Vector{Int}
     backend::B
     linSolveCache::C
+    bus_types::Vector{PSY.ACBusTypes}
 end
 
 # Backend compared by TYPE (mirrors `_reuse_dc_cache`): a change of backend rebuilds.
@@ -993,6 +1004,15 @@ _reuse_polar_nr_cache(e::PolarNRCache, matrix, nzind, backend) =
         nothing
     end
 
+# Make the reused cache repivot when the bus types differ from those its pivots were chosen
+# under. Returns `false` when the backend cannot drop its numeric factor alone (rebuild).
+function _refresh_pivots!(e::PolarNRCache, bus_type::AbstractVector{PSY.ACBusTypes})
+    e.bus_types == bus_type && return true
+    drop_numeric_factor!(e.linSolveCache) || return false
+    copyto!(e.bus_types, bus_type)
+    return true
+end
+
 # Return the persisted symbolic-factored cache when the structure+backend match; otherwise build
 # it (make + symbolic_factor!), store it, and count the symbolic factorization. `nzind` is the
 # slack-participation nonzero pattern — the same key component `_get_or_build_jacobian_structure`
@@ -1002,20 +1022,21 @@ function _get_or_build_polar_nr_cache!(
     Jv::SparseArrays.SparseMatrixCSC{Float64, J_INDEX_TYPE},
     backend,
     slack_factors::SparseVector{Float64, Int},
+    time_step::Int,
 )
     nzind = SparseArrays.nonzeroinds(slack_factors)
-    reused = _reuse_polar_nr_cache(
-        data.polar_nr_cache[],
-        data.power_network_matrix,
-        nzind,
-        backend,
-    )
-    isnothing(reused) || return reused
+    bus_type = view(data.bus_type, :, time_step)
+    entry = data.polar_nr_cache[]
+    reused = _reuse_polar_nr_cache(entry, data.power_network_matrix, nzind, backend)
+    if !isnothing(reused) && length(entry.bus_types) == length(bus_type) &&
+       _refresh_pivots!(entry, bus_type)
+        return reused
+    end
     linSolveCache = make_linear_solver_cache(backend, Jv)
     symbolic_factor!(linSolveCache, Jv)
     _count_symbolic_factor!(data)
-    data.polar_nr_cache[] =
-        PolarNRCache(data.power_network_matrix, copy(nzind), backend, linSolveCache)
+    data.polar_nr_cache[] = PolarNRCache(
+        data.power_network_matrix, copy(nzind), backend, linSolveCache, collect(bus_type))
     return linSolveCache
 end
 
@@ -1023,8 +1044,8 @@ end
 # persisted symbolic factorization (see `PolarNRCache`).
 _nr_linear_solver_cache!(
     data::ACPowerFlowData, J::ACPowerFlowJacobian, backend,
-    slack_factors::SparseVector{Float64, Int}) =
-    _get_or_build_polar_nr_cache!(data, J.Jv, backend, slack_factors)
+    slack_factors::SparseVector{Float64, Int}, time_step::Int) =
+    _get_or_build_polar_nr_cache!(data, J.Jv, backend, slack_factors, time_step)
 
 # Rectangular / mixed CB: a PV↔PQ flip changes the per-bus variable count / block pattern, so the
 # sparsity structure is NOT flip-invariant across the Q-limit loop — build + symbolically factor
@@ -1034,6 +1055,7 @@ function _nr_linear_solver_cache!(
     J::Union{ACRectangularCIJacobian, ACMixedCPBJacobian},
     backend,
     ::SparseVector{Float64, Int},
+    ::Int,
 )
     linSolveCache = make_linear_solver_cache(backend, J.Jv)
     symbolic_factor!(linSolveCache, J.Jv)
@@ -1159,7 +1181,7 @@ function _newton_power_flow(
         # Polar reuses the persisted symbolic factor; rect/mixed build fresh (structure not
         # flip-invariant). See `_nr_linear_solver_cache!` / `PolarNRCache`.
         linSolveCache = _nr_linear_solver_cache!(
-            data, J, backend, residual.bus_slack_participation_factors)
+            data, J, backend, residual.bus_slack_participation_factors, time_step)
         stateVector = StateVectorCache(x0_init, residual.Rv)
         converged, i = _run_power_flow_method(
             time_step,

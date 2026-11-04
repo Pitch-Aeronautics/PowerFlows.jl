@@ -32,12 +32,16 @@ abstract type SolverCache end
 `solver_cache` slot): the NR/TR AC Jacobian and a [`SolverCache`](@ref) can both be live in one
 solve — e.g. a FastDecoupled solve that hands off to NR uses a `FastDecoupledCache` *and* this
 structure — so the two must not contend for a single slot. Cache key is the network-matrix
-identity + slack nonzero pattern (`nzind`); see `_get_or_build_jacobian_structure`."""
+identity + slack nonzero pattern (`nzind`) + the REF rows and subnetworks it was built under (the
+distributed-slack entries sit in each subnetwork's reference column, and the area rows skip REF
+columns); see `_get_or_build_jacobian_structure`."""
 struct ACJacobianStructureCache
     matrix::PNM.AC_Ybus_Matrix
     nzind::Vector{Int}
     structure::SparseMatrixCSC{Float64, J_INDEX_TYPE}
     area_data::AreaInterchangeData
+    ref_rows::BitVector
+    subnetworks::Dict{Int64, Vector{Int64}}
 end
 
 # Centralized so the multi-line warning text can't drift between the two

@@ -59,6 +59,19 @@ full_factor!(c::PNM.AAFactorCache, A::SparseMatrixCSC{Float64}) =
     PNM.AccelerateWrapper.full_factor!(c, A)
 
 solve!(c::PNM.KLULinSolveCache, b::StridedVecOrMat{Float64}) = PNM.solve!(c, b)
+
+"""Drop the numeric factorization while keeping the symbolic analysis, so the next
+`numeric_refactor!` runs a fresh pivoting factorization (`klu_factor`) instead of
+`klu_refactor`, which reuses the pivot sequence chosen for the previous values. Returns `true`
+when the backend supports it; `false` tells the caller to rebuild the cache instead."""
+function drop_numeric_factor!(c::PNM.KLULinSolveCache{Tv, Ti}) where {Tv, Ti}
+    c.numeric == C_NULL && return true
+    num_ref = Ref(c.numeric)
+    PNM.KLUWrapper._free_numeric!(Tv, Ti, num_ref, c.common)
+    c.numeric = num_ref[]
+    return true
+end
+drop_numeric_factor!(::Any) = false
 solve!(c::PNM.AAFactorCache, b::StridedVecOrMat{Float64}) =
     PNM.AccelerateWrapper.solve!(c, b)
 
