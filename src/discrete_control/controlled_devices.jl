@@ -5,14 +5,22 @@ abstract type AbstractShuntControl <: AbstractControlledDevice end
 """Voltage-controlling tap transformer. `nz_offsets` are the 4 cached
 `nzval` linear indices of the (from,to)×(from,to) Y-bus block. The control
 orientation is NOT stored: it comes from the measured plant sensitivity dV/dp
-(see `_control_target`), which is correct for any wiring of the controlled bus."""
+(see `_control_target`), which is correct for any wiring of the controlled bus.
+
+Impedance correction (PSS/E tables, `PSY.ImpedanceCorrectionData`): PNM's `Ybus` scales the
+series impedance by the table's factor at the build-time tap. `correction` holds a
+`TAP_RATIO`-mode table, re-evaluated at every tap the controller applies, so a step is sized
+on, and the Y-bus re-stamped with, the corrected impedance at the new tap (see
+[`_series_admittance`](@ref)). A `PHASE_SHIFT_ANGLE`-mode table does not depend on the tap
+(the angle of a `TapTransformer` is its fixed winding-group shift): its factor is folded into
+`yt` at enrollment and `correction` is `nothing`."""
 mutable struct ControlledTap <: AbstractBranchControl
     name::String
     from_ix::Int
     to_ix::Int
     controlled_ix::Int
     vset::Float64
-    yt::ComplexF64                   # 1/(r+jx)
+    yt::ComplexF64                   # 1/(r+jx), divided by any tap-independent correction factor
     alpha::Float64                   # winding-group phase shift (PSY.get_α)
     p_min::Float64
     p_max::Float64
@@ -21,6 +29,52 @@ mutable struct ControlledTap <: AbstractBranchControl
     initial::Float64                 # enrollment-time tap (reporting)
     synced::Float64                  # tap reflected in the arc-admittance rows
     current::Float64
+    correction::Union{Nothing, IS.PiecewiseLinearData}   # TAP_RATIO table, or nothing
+end
+
+# The pre-correction positional form (no impedance correction table).
+ControlledTap(
+    name, from_ix, to_ix, controlled_ix, vset, yt, alpha, p_min, p_max, levels, nz_offsets,
+    initial, synced, current,
+) = ControlledTap(
+    name, from_ix, to_ix, controlled_ix, vset, yt, alpha, p_min, p_max, levels, nz_offsets,
+    initial, synced, current, nothing,
+)
+
+"""Slope of PNM's correction-table interpolation (`PNM._interpolate_correction_factor`) at
+`x`: the slope of the segment that interpolation uses there, and zero outside the table (the
+end values are held)."""
+function _correction_factor_slope(curve::IS.PiecewiseLinearData, x::Float64)
+    points = IS.get_points(curve)
+    (x < points[1].x || x > points[end].x) && return 0.0
+    @inbounds for i in 1:(length(points) - 1)
+        if x <= points[i + 1].x
+            dx = points[i + 1].x - points[i].x
+            iszero(dx) && return 0.0
+            return (points[i + 1].y - points[i].y) / dx
+        end
+    end
+    return 0.0
+end
+
+"""Series admittance of tap device `d` at tap ratio `p`: `yt`, divided by the impedance
+correction factor at `p` when a `TAP_RATIO` table is attached. PNM evaluates the same table at
+`abs(tap)` with the same interpolation, so at the enrollment tap this is the Y-bus's own
+corrected admittance."""
+@inline function _series_admittance(d::ControlledTap, p::Float64)
+    curve = d.correction
+    isnothing(curve) && return d.yt
+    return d.yt / PNM._interpolate_correction_factor(curve, abs(p))
+end
+
+"""`(yt(p), dyt/dp)` for tap device `d`: with a correction table `yt(p) = yt/F(p)`, so
+`dyt/dp = −yt(p)·F′(p)/F(p)`; without one the derivative is zero."""
+@inline function _series_admittance_and_slope(d::ControlledTap, p::Float64)
+    curve = d.correction
+    isnothing(curve) && return d.yt, zero(ComplexF64)
+    F = PNM._interpolate_correction_factor(curve, abs(p))
+    y = d.yt / F
+    return y, -y * _correction_factor_slope(curve, abs(p)) * sign(p) / F
 end
 
 """Voltage-controlling switched shunt, snapped onto the PSS/E cumulative
@@ -83,6 +137,9 @@ struct ControlledDeviceSet
     facts_b_lim::Matrix{Float64}
     facts_saturated::Matrix{Bool}
     tap_current::Matrix{Float64}
+    # Tap device index by component name (`PSY.TapTransformer` names are unique), for
+    # post-processing that recomputes a moved tap's branch flow at its solved ratio.
+    tap_index::Dict{String, Int}
     # Perf counters for the last `_control_continuation!` (counts, not wall-clock; the regression
     # harness). symbolic_factors stays O(1) per continuation with PolarNRCache reuse. See getters.
     inner_solves::Base.RefValue{Int}
@@ -111,6 +168,7 @@ function ControlledDeviceSet(
         facts_b_lim,
         facts_saturated,
         tap_current,
+        Dict{String, Int}(d.name => i for (i, d) in enumerate(taps)),
         Ref(0),
         Ref(0),
         Ref(0),
@@ -293,20 +351,20 @@ function _ybus_block_offsets(ybus, i::Int, j::Int)
 end
 
 # Y11/Y12/Y21 are delta-updated (new−old) so parallel branches' contributions
-# in the shared nzval slots are preserved; Y22=Yt is tap-independent (zero delta,
-# even with parallels) so it is skipped. The nzval is single-precision ComplexF32;
-# correctness of the running sum relies on `old_tap` coming from `d.current`
-# (the last applied value), never read back from the lossy nzval.
+# in the shared nzval slots are preserved. Y22 = yt is tap-independent unless an impedance
+# correction table re-evaluates at the new tap; its delta is exactly zero otherwise.
+# Correctness of the running sum relies on `old_tap` coming from `d.current` (the last
+# applied value), never read back from the nzval.
 function apply_parameter!(d::ControlledTap, data, p::Float64, ::Int)
     A = data.power_network_matrix.data
-    old_tap = d.current * cis(d.alpha)
-    new_tap = p * cis(d.alpha)
+    ff_old, ft_old, tf_old, tt_old = _branch_terms(d, d.current)
+    ff_new, ft_new, tf_new, tt_new = _branch_terms(d, p)
     o = d.nz_offsets
     @inbounds begin
-        A.nzval[o[1]] += d.yt / abs2(new_tap) - d.yt / abs2(old_tap)
-        A.nzval[o[2]] += -d.yt / conj(new_tap) - (-d.yt / conj(old_tap))
-        A.nzval[o[3]] += -d.yt / new_tap - (-d.yt / old_tap)
-        # Y22 = Yt is tap-independent; no update needed.
+        A.nzval[o[1]] += ff_new - ff_old
+        A.nzval[o[2]] += ft_new - ft_old
+        A.nzval[o[3]] += tf_new - tf_old
+        A.nzval[o[4]] += tt_new - tt_old
     end
     d.current = p
     return
@@ -433,11 +491,13 @@ function classify_facts_saturation!(d::ControlledFACTS, vmag::Float64)
     return d.saturated
 end
 
-# The parameter-dependent from-side arc-admittance terms (ff, ft, tf) of a tap device;
-# the tt term (= yt) is tap-independent.
+# The four series terms (ff, ft, tf, tt) of a tap device's 2×2 branch block at tap `p`, in its
+# own arc orientation, without the primary shunt (which is tap-independent and sits in ff). tt
+# (= yt) depends on the tap only through an impedance correction table.
 @inline function _branch_terms(d::ControlledTap, p::Float64)
     t = p * cis(d.alpha)
-    return (d.yt / abs2(t), -d.yt / conj(t), -d.yt / t)
+    yt = _series_admittance(d, p)
+    return (yt / abs2(t), -yt / conj(t), -yt / t, yt)
 end
 
 # Delta-update the from/to arc-admittance rows to `d.current` (parallel branches sharing the arc
@@ -454,15 +514,17 @@ function _sync_branch_arc_rows!(
     d.current == d.synced && return
     fb = ix_to_number[d.from_ix]
     tb = ix_to_number[d.to_ix]
-    ff_new, ft_new, tf_new = _branch_terms(d, d.current)
-    ff_old, ft_old, tf_old = _branch_terms(d, d.synced)
+    ff_new, ft_new, tf_new, tt_new = _branch_terms(d, d.current)
+    ff_old, ft_old, tf_old, tt_old = _branch_terms(d, d.synced)
+    corrected = !isnothing(d.correction)
     r = get(arc_row, (fb, tb), 0)
     if !iszero(r)
         @inbounds begin
             Yft.nzval[_nz_index(Yft, r, d.from_ix)] += ff_new - ff_old
             Yft.nzval[_nz_index(Yft, r, d.to_ix)] += ft_new - ft_old
             Ytf.nzval[_nz_index(Ytf, r, d.from_ix)] += tf_new - tf_old
-            # Ytf(r, to_ix) holds the tt term (= yt): parameter-independent, skipped.
+            # Ytf(r, to_ix) holds the tt term (= yt): tap-dependent only under correction.
+            corrected && (Ytf.nzval[_nz_index(Ytf, r, d.to_ix)] += tt_new - tt_old)
         end
     else
         # The branch may be stored under the reversed arc orientation; the from/to roles
@@ -478,7 +540,8 @@ function _sync_branch_arc_rows!(
             Yft.nzval[_nz_index(Yft, r, d.from_ix)] += tf_new - tf_old
             Ytf.nzval[_nz_index(Ytf, r, d.to_ix)] += ft_new - ft_old
             Ytf.nzval[_nz_index(Ytf, r, d.from_ix)] += ff_new - ff_old
-            # Yft(r, to_ix) is the reversed arc's from-side self term (= yt): skipped.
+            # Yft(r, to_ix) is the reversed arc's from-side self term (= yt).
+            corrected && (Yft.nzval[_nz_index(Yft, r, d.to_ix)] += tt_new - tt_old)
         end
     end
     d.synced = d.current

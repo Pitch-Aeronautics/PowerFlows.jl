@@ -95,6 +95,39 @@ function _tap_metadata(tx, to_bus::Int)
     )
 end
 
+# `PSY.ImpedanceCorrectionData` on each `TapTransformer`, keyed by component UUID. One pass
+# over the attribute pairs, as PNM's `build_impedance_correction_factors!` does: a per-tap
+# supplemental-attribute query hits the association store and is too slow for large cases.
+function _tap_correction_tables(sys)
+    tables = Dict{Base.UUID, PSY.ImpedanceCorrectionData}()
+    isempty(PSY.get_supplemental_attributes(PSY.ImpedanceCorrectionData, sys)) &&
+        return tables
+    for pair in PSY.get_component_supplemental_attribute_pairs(
+        PSY.TapTransformer,
+        PSY.ImpedanceCorrectionData,
+        sys,
+    )
+        tables[IS.get_uuid(pair.component)] = pair.supplemental_attribute
+    end
+    return tables
+end
+
+"""`(yt, correction)` for a tap device: the series admittance `1/(r+jx)` and, when an
+impedance correction table is attached, either the table itself (`TAP_RATIO` mode, re-evaluated
+at each tap the controller applies) or its factor folded into `yt` (`PHASE_SHIFT_ANGLE` mode,
+fixed for a `TapTransformer`). Both are evaluated exactly as PNM's `Ybus` evaluates them, so the
+device's terms at the enrollment tap equal the Y-bus block it delta-updates."""
+function _tap_series_admittance(tx, correction_tables)
+    yt = 1.0 / (PSY.get_r(tx) + PSY.get_x(tx) * im)
+    ict = get(correction_tables, IS.get_uuid(tx), nothing)
+    isnothing(ict) && return yt, nothing
+    if PSY.get_transformer_control_mode(ict) ==
+       PSY.ImpedanceCorrectionTransformerControlMode.TAP_RATIO
+        return yt, PSY.get_impedance_correction_curve(ict)
+    end
+    return yt / PNM._evaluate_correction_table(tx, ict), nothing
+end
+
 # Susceptance model of a switched shunt. The PSS/E parser (MODSW 0/1/2) stores
 # `Y = BINIT` (the TOTAL in-service admittance) and ZEROES `initial_status` to avoid
 # double counting, so the reachable set is spanned by the blocks alone (base 0) with the
@@ -152,6 +185,7 @@ function build_controlled_device_set(
     n_time_steps::Int = 1,
 )
     taps = ControlledTap[]
+    correction_tables = _tap_correction_tables(sys)
     for tx in PSY.get_available_components(PSY.TapTransformer, sys)
         PSY.get_control_objective(tx) == PSY.TransformerControlObjective.VOLTAGE ||
             continue
@@ -184,7 +218,7 @@ function build_controlled_device_set(
         end
         _validate_tap(name, md.pmin, md.pmax, md.ntp) || continue
         _validate_vset("ControlledTap", name, md.vset) || continue
-        yt = 1.0 / (PSY.get_r(tx) + PSY.get_x(tx) * im)
+        yt, correction = _tap_series_admittance(tx, correction_tables)
         tap0 = PSY.get_tap(tx)
         if !(md.pmin - BOUNDS_TOLERANCE <= tap0 <= md.pmax + BOUNDS_TOLERANCE)
             @warn "ControlledTap \"$name\": initial tap ratio $tap0 lies \
@@ -209,6 +243,7 @@ function build_controlled_device_set(
                 tap0,   # initial (reporting)
                 tap0,   # synced (arc-admittance rows reflect this tap)
                 tap0,   # current
+                correction,
             ),
         )
     end

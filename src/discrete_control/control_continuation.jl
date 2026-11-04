@@ -284,13 +284,17 @@ function _dF_dp!(rhs::Vector{Float64}, d::ControlledTap, data, ts::Int)
     Vf = data.bus_magnitude[f, ts] * cis(data.bus_angles[f, ts])
     Vt = data.bus_magnitude[t, ts] * cis(data.bus_angles[t, ts])
     p, a = d.current, d.alpha
-    # ∂Y/∂p of the from-side terms (t_c = p·cis(a)); Y_tt = yt is p-independent (see `_branch_terms`).
-    dYff = -2.0 * d.yt / p^3
-    dYft = d.yt * cis(a) / p^2
-    dYtf = d.yt * cis(-a) / p^2
-    # ∂S_i/∂p = V_i·conj(Σ_k ∂Y_ik/∂p·V_k); only Y_ff,Y_ft (row f) and Y_tf (row t) change.
+    # ∂Y/∂p of the branch terms (t_c = p·cis(a); see `_branch_terms`): Y_ff = yt/p²,
+    # Y_ft = −yt·cis(a)/p, Y_tf = −yt·cis(−a)/p, Y_tt = yt, where yt = yt(p) varies with p only
+    # through an impedance correction table (dyt = 0 without one).
+    yt, dyt = _series_admittance_and_slope(d, p)
+    dYff = dyt / p^2 - 2.0 * yt / p^3
+    dYft = (yt / p^2 - dyt / p) * cis(a)
+    dYtf = (yt / p^2 - dyt / p) * cis(-a)
+    dYtt = dyt
+    # ∂S_i/∂p = V_i·conj(Σ_k ∂Y_ik/∂p·V_k); Y_ff,Y_ft (row f) and Y_tf,Y_tt (row t) change.
     dSf = Vf * conj(dYff * Vf + dYft * Vt)
-    dSt = Vt * conj(dYtf * Vf)
+    dSt = Vt * conj(dYtf * Vf + dYtt * Vt)
     @inbounds begin
         rhs[2 * f - 1] = real(dSf)
         rhs[2 * f] = imag(dSf)

@@ -474,10 +474,42 @@ function _set_series_interior_voltages!(
 end
 
 """
-    _segment_flow_entry(segment, V_from, V_to)
+    _flow_branch_entries(segment, data, time_step) -> NTuple{4, ComplexF64}
 
-Compute a `BranchFlowEntry` for a single segment given its endpoint voltages. Returns the
-from-to and to-from complex power flows, plus losses. For non-line segments, the
+The 2×2 branch admittance block `(y11, y12, y21, y22)` a reported flow is computed from, in the
+segment's own arc orientation: the entries the Y-bus was built from, impedance correction
+included (`PNM.ybus_branch_entries(segment, nrd)`; the nr-less method is the *uncorrected*
+block). A `TapTransformer` that discrete control enrolled takes its block at the tap the solve
+ended on for `time_step` instead, with its correction table re-evaluated there, so a moved tap
+reports the flow of the network its voltages were solved on (also for multiperiod and
+`solve_power_flow` results, where the solved tap is not written back to the component).
+"""
+_flow_branch_entries(segment, data::ACPowerFlowData, ::Int) =
+    PNM.ybus_branch_entries(segment, get_network_reduction_data(data))
+
+function _flow_branch_entries(
+    segment::PSY.TapTransformer,
+    data::ACPowerFlowData,
+    time_step::Int,
+)
+    set = get_controlled_devices(data)
+    if !isnothing(set)
+        i = get(set.tap_index, PSY.get_name(segment), 0)
+        if !iszero(i)
+            d = set.taps[i]
+            (ff, ft, tf, tt) = _branch_terms(d, set.tap_current[i, time_step])
+            return (ff + PSY.get_primary_shunt(segment), ft, tf, tt)
+        end
+    end
+    return PNM.ybus_branch_entries(segment, get_network_reduction_data(data))
+end
+
+"""
+    _segment_flow_entry(segment, V_from, V_to, entries)
+
+Compute a `BranchFlowEntry` for a single segment given its endpoint voltages and its branch
+admittance block `entries = (y11, y12, y21, y22)` (see [`_flow_branch_entries`](@ref)).
+Returns the from-to and to-from complex power flows, plus losses. For non-line segments, the
 reactive loss is the sum of the terminal reactive powers from the complete branch
 admittance model.
 """
@@ -485,8 +517,9 @@ function _segment_flow_entry(
     segment::PSY.ACTransmission,
     V_from::ComplexF64,
     V_to::ComplexF64,
+    entries::Tuple,
 )
-    (y11, y12, y21, y22) = PNM.ybus_branch_entries(segment)
+    (y11, y12, y21, y22) = entries
     S_ft = V_from * conj(y11 * V_from + y12 * V_to)
     S_tf = V_to * conj(y21 * V_from + y22 * V_to)
     arc_tuple = PNM.get_arc_tuple(segment)
@@ -504,7 +537,7 @@ function _segment_flow_entry(
 end
 
 """
-    _segment_flow_entry(segment::PSY.Line, V_from, V_to)
+    _segment_flow_entry(segment::PSY.Line, V_from, V_to, entries)
 
 Compute a `BranchFlowEntry` for a transmission line using its endpoint voltages.
 Terminal active and reactive powers use the complete line admittance model. Active
@@ -515,8 +548,9 @@ function _segment_flow_entry(
     segment::PSY.Line,
     V_from::ComplexF64,
     V_to::ComplexF64,
+    entries::Tuple,
 )
-    (y11, y12, y21, y22) = PNM.ybus_branch_entries(segment)
+    (y11, y12, y21, y22) = entries
     S_ft = V_from * conj(y11 * V_from + y12 * V_to)
     S_tf = V_to * conj(y21 * V_from + y22 * V_to)
     S_ft_series = V_from * conj(y12 * (V_to - V_from))
@@ -534,6 +568,11 @@ function _segment_flow_entry(
         imag(S_ft_series) + imag(S_tf_series),
     ))
 end
+
+# The flow entry of one segment of `data`'s network at `time_step`.
+_segment_flow_entry(segment, V_from::ComplexF64, V_to::ComplexF64, data, time_step::Int) =
+    _segment_flow_entry(
+        segment, V_from, V_to, _flow_branch_entries(segment, data, time_step))
 
 """
     _get_arc_endpoint_voltages(data, arc, time_step)
@@ -571,7 +610,7 @@ function _compute_segment_flows(
     time_step::Int,
 )
     (V_from, V_to) = _get_arc_endpoint_voltages(data, arc, time_step)
-    return [_segment_flow_entry(arc_entry, V_from, V_to)]
+    return [_segment_flow_entry(arc_entry, V_from, V_to, data, time_step)]
 end
 
 function _compute_segment_flows(
@@ -583,7 +622,7 @@ function _compute_segment_flows(
     (V_from, V_to) = _get_arc_endpoint_voltages(data, arc, time_step)
     entries = BranchFlowEntry[]
     for segment in arc_entry
-        entry = _segment_flow_entry(segment, V_from, V_to)
+        entry = _segment_flow_entry(segment, V_from, V_to, data, time_step)
         push!(entries, entry)
     end
     return entries
@@ -612,10 +651,11 @@ function _compute_segment_flows(
             # All branches in a parallel set share the same arc orientation,
             # so _segment_flow_entry works directly on each individual branch.
             for branch in segment
-                push!(entries, _segment_flow_entry(branch, V_from, V_to))
+                push!(
+                    entries, _segment_flow_entry(branch, V_from, V_to, data, time_step))
             end
         else
-            push!(entries, _segment_flow_entry(segment, V_from, V_to))
+            push!(entries, _segment_flow_entry(segment, V_from, V_to, data, time_step))
         end
 
         prev_bus_no = current_bus_no
