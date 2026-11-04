@@ -171,9 +171,11 @@ end
 # Sensitivity context: residual+Jacobian built at the CURRENT converged base state and numerically
 # factored (reusing the base NR solve's persisted symbolic factorization). Built ONCE per
 # continuation (probe phase) and thereafter kept current by `_refresh_sensitivity_context!`
-# (values-only, no rebuild) after each batched-pass joint solve. `nothing` ⇒ the linear path is
-# unavailable (non-polar formulation, or the base Jacobian is singular) and the caller uses FD probes.
-struct _SensitivityContext{C, R, JT}
+# (values-only) after each batched-pass joint solve, or rebuilt in place when that solve changed
+# the bus types. `nothing` ⇒ the linear path is unavailable (non-polar formulation, or the base
+# Jacobian is singular) and the caller uses FD probes. Mutable so a rebuild can replace its
+# objects while the continuation keeps holding the same context.
+mutable struct _SensitivityContext{C, R, JT}
     lin_cache::C
     residual::R             # persisted; re-evaluated in place by _refresh_sensitivity_context!
     J::JT                   # persisted; re-evaluated in place by _refresh_sensitivity_context!
@@ -183,12 +185,24 @@ struct _SensitivityContext{C, R, JT}
     # factors/validate_indices are computed ONCE at construction from bus_type and are NOT
     # recomputed by the residual functor — a Q-limit PV→PQ flip elsewhere in the network after
     # this ctx was built silently stales that structure. `_refresh_sensitivity_context!` checks
-    # this snapshot and refuses to reuse a ctx whose bus-type pattern has since changed.
+    # this snapshot and rebuilds a ctx whose bus-type pattern has since changed.
     bus_type::Vector{PSY.ACBusTypes}
 end
 
 _sensitivity_context(::AbstractACPowerFlow, data, ts::Int; kwargs...) = nothing
 function _sensitivity_context(pf::ACPolarPowerFlow, data, ts::Int; kwargs...)
+    ctx = _build_sensitivity_context(data, ts; kwargs...)
+    # One full sensitivity-context build (fresh residual + Jacobian structure + refactor) per
+    # continuation. `_refresh_sensitivity_context!` re-evaluates VALUES into these same objects
+    # on every subsequent batched pass, or rebuilds them after a bus-type change, and does NOT
+    # count here: the Jacobian sparsity (and thus the persisted symbolic factorization this
+    # counter tracks) is invariant under the PV→PQ flips that cause a rebuild, so only this one
+    # build should ever register.
+    isnothing(ctx) || _count_symbolic_factor!(data)
+    return ctx
+end
+
+function _build_sensitivity_context(data, ts::Int; kwargs...)
     backend = resolve_linear_solver_backend(get(kwargs, :linear_solver, nothing))
     residual = ACPowerFlowResidual(data, ts)
     x = calculate_x0(data, ts)
@@ -204,23 +218,39 @@ function _sensitivity_context(pf::ACPolarPowerFlow, data, ts::Int; kwargs...)
         e isa LinearAlgebra.SingularException || rethrow()
         return                    # singular base Jacobian ⇒ fall back to FD probes
     end
-    # One full sensitivity-context build (fresh residual + Jacobian structure + refactor) per
-    # continuation. `_refresh_sensitivity_context!` re-evaluates VALUES into these same objects
-    # on every subsequent batched pass and does NOT count here — the Jacobian structure (and thus
-    # the persisted symbolic factorization this counter tracks) is topology-invariant across the
-    # continuation, so only this one build should ever register.
-    _count_symbolic_factor!(data)
     n = length(residual.Rv)
     return _SensitivityContext(
         lin_cache, residual, J, zeros(n), zeros(n), copy(view(data.bus_type, :, ts)))
+end
+
+# Rebuild `ctx` in place at the current converged state (after a bus-type change); `false` when
+# the rebuilt Jacobian is singular, leaving `ctx` as it was.
+function _rebuild_sensitivity_context!(
+    ctx::_SensitivityContext, data, ts::Int; kwargs...,
+)::Bool
+    fresh = _build_sensitivity_context(data, ts; kwargs...)
+    isnothing(fresh) && return false
+    ctx.lin_cache = fresh.lin_cache
+    ctx.residual = fresh.residual
+    ctx.J = fresh.J
+    ctx.rhs = fresh.rhs
+    ctx.sol = fresh.sol
+    ctx.bus_type = fresh.bus_type
+    cd = data.controlled_devices
+    isnothing(cd) || (cd.context_rebuilds[] += 1)
+    return true
 end
 
 # Values-only refresh at a new converged base state: the Jacobian sparsity depends only on
 # topology/REF layout (invariant across the continuation), so re-evaluating values + numeric
 # refactor into the persisted objects replaces a full rebuild — UNLESS a PV↔PQ flip has changed
 # the slack-participation/subnetwork layout the persisted `residual` baked in at construction
-# (see `_SensitivityContext.bus_type`); that case, and a singular refactor, both return `false`
-# so the caller falls back to the sequential path (which rebuilds fresh).
+# (see `_SensitivityContext.bus_type`). Then the context is rebuilt in place from the current
+# state (`_rebuild_sensitivity_context!`: a fresh residual and Jacobian, the shared symbolic
+# factorization reused and the pivots refreshed for the new types). Only a singular refactor
+# or rebuild returns `false`, sending the caller to the sequential per-device path. Before, a
+# flip returned `false` here, and since the inner solves' Q-limit flips are one-way every later
+# pass of the continuation ran the per-device path: one full solve per device per pass.
 #
 # `P_net`/`Q_net`/`P_net_set` and the four constant-I/Z withdrawal vectors are all captured from
 # `data` ONCE at `ACPowerFlowResidual` construction and are NOT independently re-read by the
@@ -234,8 +264,11 @@ end
 # `apply_parameter!` for switched shunts/FACTS writes device moves directly into
 # `data.bus_reactive_power_constant_impedance_withdrawals`, so the four constant-I/Z vectors need
 # the same re-sync.
-function _refresh_sensitivity_context!(ctx::_SensitivityContext, data, ts::Int)::Bool
-    view(data.bus_type, :, ts) == ctx.bus_type || return false
+function _refresh_sensitivity_context!(
+    ctx::_SensitivityContext, data, ts::Int; kwargs...,
+)::Bool
+    view(data.bus_type, :, ts) == ctx.bus_type ||
+        return _rebuild_sensitivity_context!(ctx, data, ts; kwargs...)
     residual = ctx.residual
     copyto!(
         residual.bus_active_constant_I,
@@ -705,7 +738,7 @@ function _batched_pass!(
     moved |= _apply_targets_group!(set.facts, off_facts, data, ts, S, frozen, dVdp, osc,
         prev_sign, n_shared, p_prev, did_move)
     moved || return true, true            # nothing wanted to move ⇒ settled, no solve needed
-    if _ctrl_solve!(pf, data, ts; kwargs...) && _refresh_sensitivity_context!(ctx, data, ts)
+    if _ctrl_solve!(pf, data, ts; kwargs...) && _refresh_sensitivity_context!(ctx, data, ts; kwargs...)
         _refresh_gains_group!(set.taps, 0, data, ts, frozen, dVdp, did_move, ctx)
         _refresh_gains_group!(set.shunts, n_taps, data, ts, frozen, dVdp, did_move, ctx)
         _refresh_gains_group!(set.facts, off_facts, data, ts, frozen, dVdp, did_move, ctx)
@@ -778,6 +811,7 @@ function _control_pass!(
             _batched_pass!(set, n_taps, n_shunts, data, ts, S, pf, scratch_snap, frozen,
                 dVdp, osc, prev_sign, n_shared, p_prev, did_move, ctx; kwargs...)
         converged && return s
+        set.batched_fallbacks[] += 1
     end
     return _step_voltage_groups!(set, n_taps, n_shunts, data, ts, S, pf, scratch_snap,
         frozen, dVdp, osc, prev_sign, n_shared; kwargs...)
@@ -793,6 +827,8 @@ function _control_continuation!(
     set.inner_solves[] = 0
     set.symbolic_factors[] = 0
     set.numeric_refactors[] = 0
+    set.batched_fallbacks[] = 0
+    set.context_rebuilds[] = 0
     converged = _ctrl_solve!(pf, data, ts; kwargs...)
     converged || return false
     for d in set.taps
@@ -883,6 +919,14 @@ function _control_continuation!(
         end
         settled = false
         for _ in 1:MAX_CONTROL_PASSES_PER_STAGE
+            if !use_batched
+                # No context yet (the probe-phase build hit a singular Jacobian): try again at
+                # this pass's converged state, so one bad base point does not leave the whole
+                # continuation on the per-device path. `nothing` again for a non-polar
+                # formulation, which has no linear path.
+                ctx = _sensitivity_context(pf, data, ts; kwargs...)
+                use_batched = !isnothing(ctx)
+            end
             settled = _control_pass!(
                 set, n_taps, n_shunts, use_batched, data, ts, S, pf,
                 scratch_snap,

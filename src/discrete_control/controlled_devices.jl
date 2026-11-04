@@ -157,6 +157,10 @@ struct ControlledDeviceSet
     inner_solves::Base.RefValue{Int}
     symbolic_factors::Base.RefValue{Int}
     numeric_refactors::Base.RefValue{Int}
+    # Passes that wanted the batched path but ran the sequential per-device path (a failed joint
+    # solve or sensitivity refresh), and sensitivity-context rebuilds after a bus-type change.
+    batched_fallbacks::Base.RefValue{Int}
+    context_rebuilds::Base.RefValue{Int}
 end
 function ControlledDeviceSet(
     taps::Vector{ControlledTap},
@@ -181,6 +185,8 @@ function ControlledDeviceSet(
         facts_saturated,
         tap_current,
         Dict{String, Int}(d.name => i for (i, d) in enumerate(taps)),
+        Ref(0),
+        Ref(0),
         Ref(0),
         Ref(0),
         Ref(0),
@@ -276,6 +282,21 @@ end
     cd = data.controlled_devices
     isnothing(cd) || (cd.numeric_refactors[] += 1)
     return
+end
+
+"""Number of passes of the last discrete-control continuation that wanted the batched (one joint
+solve) path but ran the sequential per-device path instead (0 when built without control, or
+when the continuation never batched: a non-polar formulation, or no sensitivity context)."""
+function get_control_batched_fallback_count(data)
+    isnothing(data.controlled_devices) && return 0
+    return data.controlled_devices.batched_fallbacks[]
+end
+
+"""Number of times the last discrete-control continuation rebuilt its sensitivity context after
+a bus-type change (a Q-limit PV→PQ flip in an inner solve)."""
+function get_control_context_rebuild_count(data)
+    isnothing(data.controlled_devices) && return 0
+    return data.controlled_devices.context_rebuilds[]
 end
 
 """Number of per-NR-iteration NUMERIC refactorizations performed inside the last
