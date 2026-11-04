@@ -22,15 +22,19 @@
 # a fixed member rejoins when the share it would get falls back inside its bound, and a
 # saturated group returns to PV at its setpoint when |V_X| has crossed it (above with the
 # members at Qmax, below at Qmin).
+# A group saturated in the stored state (every plant at its limit on the side PSS/E leaves it,
+# Qmax with |V_X| below the setpoint or Qmin above) starts saturated, X PQ at its stored |V|, so a
+# warm start reproduces the stored point; the return rule frees it if |V_X| crosses the setpoint.
 #
 # Data contract (each key in `ext[key]` or `ext["psse"][key]`, upper or lower case under "psse"):
 # - `IREG`: the regulated bus number; 0, absent or the unit's own bus is local
 #   (`_generator_remote_bus`).
 # - `RMPCT`: the unit's percent share; absent ⇒ 100 (PSS/E's default); not positive ⇒ 100 with a
-#   warning. A plant's share is the sum over the available units at its bus.
+#   warning. A plant is the available generators at a bus: its share is their RMPCT sum, its
+#   limits their summed Q limits; other injections at the bus (FACTS, sources) stay fixed.
 # - `VS`: the scheduled voltage of the regulated bus. Absent ⇒ X's stored |V| (PowerSystems'
 #   v33 reader keeps IREG and RMPCT but drops VS, and its v35 reader drops IREG and RMPCT).
-#   When X has a regulating plant of its own, X's PV setpoint is used.
+#   The largest-share plant's VS is used, X's own plant's included.
 
 """One remote-regulation group: the plants (`members`, bus indices) that hold the voltage of
 `regulated_ix` at `vset`, with their RMPCT shares. When the regulated bus has a regulating plant
@@ -55,6 +59,9 @@ regulates a remote bus, or when `remote_voltage_control` is off.
 - `status[row, ts]`: 0 sharing, +1 fixed at its bus's Qmax, −1 fixed at its Qmin.
 - `q_base[g, ts]`: the regulated bus's reactive injection outside the group (its stored injection
   when it has no regulating plant of its own, else 0).
+- `q_fixed[row, ts]`: a member bus's reactive injection outside its plant (FACTS, sources and
+  other non-generator injections), kept fixed; the plant is the bus's available generators.
+- `q_bounds[row]`: the plant's reactive limits, summed over its generators.
 - `returns`: rejoins per (member row, time step) in the running time step's solve, capped at
   `MAX_Q_LIMIT_FLIP_FLOPS`."""
 mutable struct RemoteVoltageControl
@@ -63,12 +70,14 @@ mutable struct RemoteVoltageControl
     member_group::Vector{Int}
     status::Matrix{Int8}
     q_base::Matrix{Float64}
+    q_fixed::Matrix{Float64}
+    q_bounds::Vector{Tuple{Float64, Float64}}
     returns::Dict{Tuple{Int, Int}, Int}
 end
 
 RemoteVoltageControl() = RemoteVoltageControl(
-    RemoteVoltageGroup[], Int[], Int[], zeros(Int8, 0, 0), zeros(0, 0),
-    Dict{Tuple{Int, Int}, Int}())
+    RemoteVoltageGroup[], Int[], Int[], zeros(Int8, 0, 0), zeros(0, 0), zeros(0, 0),
+    Tuple{Float64, Float64}[], Dict{Tuple{Int, Int}, Int}())
 
 has_remote_voltage_groups(rvc::RemoteVoltageControl) = !isempty(rvc.groups)
 _rv_status_column(rvc::RemoteVoltageControl, ts::Int) =
@@ -88,17 +97,19 @@ end
     return S
 end
 
-@inline function _rv_limit(data, b::Int, ts::Int, st::Integer)
-    lo, hi = data.bus_reactive_power_bounds[b, ts]
+@inline function _rv_limit(rvc::RemoteVoltageControl, row::Int, st::Integer)
+    lo, hi = rvc.q_bounds[row]
     return st > 0 ? hi : lo
 end
 
-# A member's own reactive injection (the regulated bus's fixed part taken off when the member
-# is the regulated bus's plant).
-@inline _rv_member_q(data, rvc, g::Int, grp::RemoteVoltageGroup, b::Int, ts::Int) =
-    b == grp.regulated_ix ?
-    data.bus_reactive_power_injections[b, ts] - rvc.q_base[g, ts] :
-    data.bus_reactive_power_injections[b, ts]
+# Member `k`'s plant reactive power: its bus's injection less what is not its plant (`q_fixed`:
+# FACTS, sources and other non-generator injections at the bus; and, at the regulated bus,
+# `q_base`, which is 0 when X has a plant of its own).
+@inline function _rv_member_q(data, rvc, g::Int, grp::RemoteVoltageGroup, k::Int, ts::Int)
+    b = grp.members[k]
+    q = data.bus_reactive_power_injections[b, ts] - rvc.q_fixed[grp.offset + k, ts]
+    return b == grp.regulated_ix ? q - rvc.q_base[g, ts] : q
+end
 
 """Read a key from a component's `ext`, or from `ext["psse"]` under the key or its lower case."""
 function _ext_psse_value(c, key::String)
@@ -249,15 +260,14 @@ function _enroll_remote_voltage_control!(data, pf, sys)
         end
         isempty(plants) && continue
         members = x_member ? vcat(X, plants) : plants
+        # The setpoint: the plants' VS (X's own plant's included), else X's stored |V|.
         vset = data.bus_magnitude[X, 1]
-        if !x_member
-            setpoints = [(share[b], vs[b]) for b in plants if !isnothing(vs[b])]
-            if !isempty(setpoints)
-                vset = last(argmax(first, setpoints))
-                if any(abs(v - vset) > 1e-4 for (_, v) in setpoints)
-                    @warn "Plants regulating bus $(numbers[X]) disagree on its scheduled \
-                        voltage (VS); using $vset, the largest share's." maxlog = PF_MAX_LOG
-                end
+        setpoints = [(share[b], vs[b]) for b in members if !isnothing(vs[b])]
+        if !isempty(setpoints)
+            vset = last(argmax(first, setpoints))
+            if any(abs(v - vset) > 1e-4 for (_, v) in setpoints)
+                @warn "Plants regulating bus $(numbers[X]) disagree on its scheduled \
+                    voltage (VS); using $vset, the largest share's." maxlog = PF_MAX_LOG
             end
         end
         push!(groups, RemoteVoltageGroup(X, numbers[X], members, numbers[members],
@@ -272,6 +282,14 @@ function _enroll_remote_voltage_control!(data, pf, sys)
     rvc.member_group = zeros(Int, n_buses)
     rvc.status = zeros(Int8, offset, n_ts)
     rvc.q_base = zeros(length(groups), n_ts)
+    rvc.q_fixed = zeros(offset, n_ts)
+    rvc.q_bounds = fill((0.0, 0.0), offset)
+    for grp in groups, (k, b) in enumerate(grp.members)
+        q_plant, lo, hi = _rv_plant_q_and_bounds(units[b], pf)
+        rvc.q_bounds[grp.offset + k] = (lo, hi)
+        rvc.q_fixed[grp.offset + k, :] .= view(data.bus_reactive_power_injections, b, :) .-
+                                          q_plant
+    end
     empty!(rvc.returns)
     for (g, grp) in enumerate(groups)
         X = grp.regulated_ix
@@ -282,13 +300,27 @@ function _enroll_remote_voltage_control!(data, pf, sys)
         x_member = first(grp.members) == X
         for ts in 1:n_ts
             rvc.q_base[g, ts] = x_member ? 0.0 : data.bus_reactive_power_injections[X, ts]
-            data.bus_type[X, ts] = PSY.ACBusTypes.PV
-            data.bus_magnitude[X, ts] = grp.vset
             for b in grp.members
                 b == X || (data.bus_type[b, ts] = PSY.ACBusTypes.PQ)
             end
+            side = pf.check_reactive_power_limits ?
+                   _rv_stored_saturation(data, rvc, g, grp, ts) : 0
+            if iszero(side)
+                data.bus_type[X, ts] = PSY.ACBusTypes.PV
+                data.bus_magnitude[X, ts] = grp.vset
+            else
+                # Saturated in the stored state (VARLIM 0): every plant at its limit on the side
+                # PSS/E leaves it, X at its stored |V| off VS. It starts fixed, X PQ, and the
+                # return rule brings X back to PV once |V_X| crosses VS.
+                rvc.status[(grp.offset + 1):(grp.offset + length(grp.members)), ts] .= side
+                data.bus_type[X, ts] = PSY.ACBusTypes.PQ
+                _rv_set_fixed_injections!(data, rvc, g, grp, ts)
+            end
         end
     end
+    n_sat = count(g -> !iszero(rvc.status[rvc.groups[g].offset + 1, 1]), eachindex(groups))
+    n_sat > 0 && @info "Remote voltage control: $n_sat regulated bus(es) start saturated: \
+        every plant at its reactive limit in the stored state, the bus off its setpoint."
     slack = [numbers[b] for grp in groups for b in grp.members if b != grp.regulated_ix &&
              any(!iszero, view(data.bus_slack_participation_factors, b, :))]
     if !isempty(slack)
@@ -298,6 +330,51 @@ function _enroll_remote_voltage_control!(data, pf, sys)
     @info "Remote voltage control: $(length(groups)) regulated bus(es), \
         $(sum(grp -> count(!=(grp.regulated_ix), grp.members), groups)) remote plant(s)."
     return
+end
+
+"""Tolerance (p.u. Q, 1 MVAr on a 100 MVA base) within which a plant's stored reactive power
+counts as at its limit for `_rv_stored_saturation`."""
+const REMOTE_VOLTAGE_STORED_LIMIT_TOLERANCE = 1e-2
+
+"""Whether group `grp` is saturated in the stored state at `ts`, as PSS/E's VARLIM leaves a group
+that cannot hold its bus: every member plant's stored Q within
+`REMOTE_VOLTAGE_STORED_LIMIT_TOLERANCE` of its bus's Qmax with |V_X| below the setpoint (+1), or
+of Qmin with |V_X| above it (−1, by more than `Q_LIMIT_RETURN_VOLTAGE_TOLERANCE`). 0 otherwise:
+the group starts sharing at the setpoint. Reads `data` as initialised (X's stored |V|)."""
+function _rv_stored_saturation(data, rvc::RemoteVoltageControl, g::Int,
+    grp::RemoteVoltageGroup, ts::Int)
+    V = data.bus_magnitude[grp.regulated_ix, ts]
+    tol = Q_LIMIT_RETURN_VOLTAGE_TOLERANCE
+    side = V < grp.vset - tol ? 1 : V > grp.vset + tol ? -1 : 0
+    iszero(side) && return 0
+    δ = REMOTE_VOLTAGE_STORED_LIMIT_TOLERANCE
+    for k in eachindex(grp.members)
+        q = _rv_member_q(data, rvc, g, grp, k, ts)
+        lo, hi = rvc.q_bounds[grp.offset + k]
+        hi - lo > BOUNDS_TOLERANCE || return 0
+        abs(q - (side > 0 ? hi : lo)) <= δ || return 0
+    end
+    return side
+end
+
+"""A plant's stored reactive power and its summed limits, over the generators at its bus that
+inject reactive power (as `_get_injections!` and `_get_reactive_power_bound!` count them); an
+unbounded generator makes the plant unbounded."""
+function _rv_plant_q_and_bounds(gens, pf)
+    q, lo, hi = 0.0, 0.0, 0.0
+    for g in gens
+        (contributes_reactive_power(g) &&
+         reactive_power_contribution_type(g) == PowerContributionType.INJECTION) || continue
+        q += PSY.get_reactive_power(g)
+        lims = get_reactive_power_limits_for_power_flow(g)
+        if isnothing(lims) || isinf(lims.min) || isinf(lims.max)
+            lo, hi = -Inf, Inf
+        else
+            lo += lims.min
+            hi += lims.max
+        end
+    end
+    return q, lo, hi
 end
 
 """Write each sharing group's injections from its Q_tot slot `x[2X−1]` into `data` (and into
@@ -321,8 +398,9 @@ function _apply_remote_voltage_injections!(
             q = if st == 0
                 S > 0.0 ? grp.shares[k] / S * Qt : 0.0
             else
-                _rv_limit(data, b, ts, st)
+                _rv_limit(rvc, grp.offset + k, st)
             end
+            q += rvc.q_fixed[grp.offset + k, ts]
             if b == X
                 qx += q
             else
@@ -348,7 +426,7 @@ function _remote_voltage_state!(x::Vector{Float64}, data, ts::Int)
         Qt = 0.0
         for (k, b) in enumerate(grp.members)
             rvc.status[grp.offset + k, ts] == 0 || continue
-            Qt += _rv_member_q(data, rvc, g, grp, b, ts)
+            Qt += _rv_member_q(data, rvc, g, grp, k, ts)
         end
         x[2 * X - 1] = Qt
     end
@@ -428,8 +506,8 @@ function _remote_voltage_q_limits!(data, ts::Int)
             for (k, b) in enumerate(grp.members)
                 row = grp.offset + k
                 rvc.status[row, ts] == 0 || continue
-                q = _rv_member_q(data, rvc, g, grp, b, ts)
-                lo, hi = data.bus_reactive_power_bounds[b, ts]
+                q = _rv_member_q(data, rvc, g, grp, k, ts)
+                lo, hi = rvc.q_bounds[grp.offset + k]
                 st = q > hi + BOUNDS_TOLERANCE ? 1 : q < lo - BOUNDS_TOLERANCE ? -1 : 0
                 st == 0 && continue
                 rvc.status[row, ts] = st
@@ -453,14 +531,14 @@ function _remote_voltage_q_limits!(data, ts::Int)
             Qt = 0.0
             for (k, b) in enumerate(grp.members)
                 rvc.status[grp.offset + k, ts] == 0 &&
-                    (Qt += _rv_member_q(data, rvc, g, grp, b, ts))
+                    (Qt += _rv_member_q(data, rvc, g, grp, k, ts))
             end
             λ = Qt / S
             for (k, b) in enumerate(grp.members)
                 row = grp.offset + k
                 st = rvc.status[row, ts]
                 st == 0 && continue
-                lo, hi = data.bus_reactive_power_bounds[b, ts]
+                lo, hi = rvc.q_bounds[grp.offset + k]
                 q = grp.shares[k] * λ
                 back = (st > 0 && q < hi - BOUNDS_TOLERANCE) ||
                        (st < 0 && q > lo + BOUNDS_TOLERANCE)
@@ -477,7 +555,7 @@ function _remote_voltage_q_limits!(data, ts::Int)
             for (k, b) in enumerate(grp.members)
                 row = grp.offset + k
                 rvc.status[row, ts] == side || continue
-                lo, hi = data.bus_reactive_power_bounds[b, ts]
+                lo, hi = rvc.q_bounds[grp.offset + k]
                 hi - lo > BOUNDS_TOLERANCE || continue
                 _rv_rejoin!(rvc, row, ts, names[b]) && (back = true)
             end
@@ -518,7 +596,7 @@ function _rv_set_fixed_injections!(data, rvc, g::Int, grp::RemoteVoltageGroup, t
     for (k, b) in enumerate(grp.members)
         st = rvc.status[grp.offset + k, ts]
         st == 0 && continue
-        q = _rv_limit(data, b, ts, st)
+        q = _rv_limit(rvc, grp.offset + k, st) + rvc.q_fixed[grp.offset + k, ts]
         data.bus_reactive_power_injections[b, ts] = b == X ? rvc.q_base[g, ts] + q : q
     end
     return

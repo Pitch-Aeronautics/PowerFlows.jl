@@ -151,7 +151,7 @@ end
     # X with its own plant: X's plant shares with the remote one, X held at its own setpoint.
     own = [(bus = 3, ireg = 0, rmpct = 50.0, qmin = -3.0, qmax = 3.0),
         (bus = 2, ireg = 3, rmpct = 50.0, qmin = -3.0, qmax = 3.0)]
-    data, bl = _rv_solve(; units = own, x_type = ACBusTypes.PV, x_vm = 1.025)
+    data, bl = _rv_solve(; units = own, x_type = ACBusTypes.PV, x_vm = 1.025, vs = 1.025)
     grp = only(PF.get_remote_voltage_groups(data))
     @test grp.member_numbers == [3, 2] && grp.vset == 1.025
     @test _rv_v(data, bl, 3) ≈ 1.025 atol = 1e-9
@@ -200,7 +200,7 @@ end
     units = [merge(_RV_AB[1], (qmax = qa / 2,)), _RV_AB[2]]
     data, bl = _rv_solve(; units = units, q = true)
     # Its bound raised past its share: the check frees it, and the solve is the free one.
-    data.bus_reactive_power_bounds[bl[2], 1] = (-3.0, 3.0)
+    data.remote_voltage_control.q_bounds[1] = (-3.0, 3.0)
     @test !PF._check_q_limit_bounds!(data, 1)
     @test [s for (_, _, s) in PF.get_remote_voltage_status(data)[3]] == [0, 0]
     @test solve_power_flow!(data)
@@ -324,4 +324,143 @@ end
         @test data.bus_magnitude[:, ts] ≈ one.bus_magnitude[:, 1] atol = 1e-9
         @test PF.get_remote_voltage_status(data, ts) == PF.get_remote_voltage_status(one)
     end
+end
+
+# A group saturated in the stored state (PSS/E's VARLIM 0 leaves every plant at its limit and X
+# off VS) starts saturated: plants fixed at their limits, X PQ at its stored |V|. Stored states
+# come from `solve_and_store_power_flow!` on the synthetic systems.
+function _rv_stored(; units, q = true, kw...)
+    sys = _rv_system(; units = units, kw...)
+    @test solve_and_store_power_flow!(ACPolarPowerFlow(; check_reactive_power_limits = q), sys)
+    # A plant at its limit is written back PQ, as a Q-limit release is; in a PSS/E stored case
+    # its bus stays a generator bus.
+    for u in units
+        set_bustype!(get_bus(sys, u.bus), ACBusTypes.PV)
+    end
+    return sys
+end
+
+function _rv_initial_residual(data)
+    residual = PF.ACPowerFlowResidual(data, 1)
+    residual(PF.calculate_x0(data, 1), 1)
+    return maximum(abs, residual.Rv)
+end
+
+const _RV_TIGHT = [merge(u, (qmax = 0.1,)) for u in _RV_AB]
+
+@testset "remote voltage control: a group saturated in the stored state starts saturated (GAP-015)" begin
+    sys = _rv_stored(; units = _RV_TIGHT)
+    vx = get_magnitude(get_bus(sys, 3))
+    @test vx < 1.02 - 1e-3                               # stored below VS, both plants at Qmax
+    pf = ACPolarPowerFlow(; check_reactive_power_limits = true)
+    data = PowerFlowData(pf, sys)
+    bl = PF.get_bus_lookup(data)
+    @test [s for (_, _, s) in PF.get_remote_voltage_status(data)[3]] == [1, 1]
+    @test data.bus_type[bl[3], 1] == ACBusTypes.PQ
+    @test data.bus_magnitude[bl[3], 1] == vx
+    # The warm start is the stored point: no mismatch, and the solve leaves it there.
+    @test _rv_initial_residual(data) < 1e-8
+    stored = copy(data.bus_magnitude[:, 1])
+    @test solve_power_flow!(data; maxIterations = 2)
+    @test data.bus_magnitude[:, 1] ≈ stored atol = 1e-9
+    @test data.bus_type[bl[3], 1] == ACBusTypes.PQ
+    # Started sharing at VS instead (Q limits off), the same stored point is far off.
+    free = PowerFlowData(ACPolarPowerFlow(), sys)
+    @test free.bus_type[PF.get_bus_lookup(free)[3], 1] == ACBusTypes.PV
+    @test _rv_initial_residual(free) > 1e-3
+    # Not saturated in its stored state (the free solve): it starts sharing at VS.
+    data = PowerFlowData(pf, _rv_stored(; units = _RV_AB))
+    @test data.bus_type[PF.get_bus_lookup(data)[3], 1] == ACBusTypes.PV
+    @test all(s == 0 for (_, _, s) in PF.get_remote_voltage_status(data)[3])
+end
+
+@testset "remote voltage control: a stored-saturated group desaturates when V_X crosses VS (GAP-015)" begin
+    sys = _rv_stored(; units = _RV_TIGHT)
+    # VS just above the stored |V_X| (still saturated on PSS/E's side), and a stronger source
+    # (REF raised to 1.08): with both plants at Qmax, |V_X| now rises past VS.
+    vs = get_magnitude(get_bus(sys, 3)) + 0.005
+    for g in get_components(ThermalStandard, sys)
+        get_ext(g)["VS"] = vs
+    end
+    set_magnitude!(get_bus(sys, 1), 1.08)
+    data = PowerFlowData(ACPolarPowerFlow(; check_reactive_power_limits = true), sys)
+    bl = PF.get_bus_lookup(data)
+    @test data.bus_type[bl[3], 1] == ACBusTypes.PQ        # starts saturated
+    @test solve_power_flow!(data)
+    @test data.bus_type[bl[3], 1] == ACBusTypes.PV
+    @test _rv_v(data, bl, 3) ≈ vs atol = 1e-9
+    @test all(s == 0 for (_, _, s) in PF.get_remote_voltage_status(data)[3])
+    @test _rv_q(data, bl, 2) < 0.1 && _rv_q(data, bl, 4) < 0.1
+    @test _rv_q(data, bl, 2) / _rv_q(data, bl, 4) ≈ 1.5 rtol = 1e-9
+end
+
+@testset "remote voltage control: X's own plant, stored Q in the slot and stored saturation (GAP-015)" begin
+    own = [(bus = 3, ireg = 0, rmpct = 50.0, qmin = -3.0, qmax = 3.0),
+        (bus = 2, ireg = 3, rmpct = 50.0, qmin = -3.0, qmax = 3.0)]
+    kw = (; x_type = ACBusTypes.PV, x_vm = 1.02)
+    # Sharing: Q_tot starts as the members' summed stored Q, X's own plant included.
+    sys = _rv_stored(; units = own, kw...)
+    data = PowerFlowData(ACPolarPowerFlow(; check_reactive_power_limits = true), sys)
+    grp = only(PF.get_remote_voltage_groups(data))
+    X = grp.regulated_ix
+    qsum = PSY.with_units_base(sys, PSY.UnitSystem.SYSTEM_BASE) do
+        sum(get_reactive_power(g) for g in get_components(ThermalStandard, sys))
+    end
+    @test PF.calculate_x0(data, 1)[2X - 1] ≈ qsum atol = 1e-9
+    @test _rv_initial_residual(data) < 1e-8
+    # Saturated: X's plant and the remote one at Qmax, X (PV in the data) below VS: X starts PQ
+    # at its stored |V|, and the stored point solves as it stands.
+    tight = [merge(u, (qmax = 0.1,)) for u in own]
+    sys = _rv_stored(; units = tight, kw...)
+    vx = get_magnitude(get_bus(sys, 3))
+    @test vx < 1.02 - 1e-3
+    data = PowerFlowData(ACPolarPowerFlow(; check_reactive_power_limits = true), sys)
+    bl = PF.get_bus_lookup(data)
+    @test only(PF.get_remote_voltage_groups(data)).vset == 1.02
+    @test data.bus_type[bl[3], 1] == ACBusTypes.PQ
+    @test data.bus_magnitude[bl[3], 1] == vx
+    @test [s for (_, _, s) in PF.get_remote_voltage_status(data)[3]] == [1, 1]
+    @test _rv_initial_residual(data) < 1e-8
+    stored = copy(data.bus_magnitude[:, 1])
+    @test solve_power_flow!(data; maxIterations = 2)
+    @test data.bus_magnitude[:, 1] ≈ stored atol = 1e-9
+end
+
+@testset "remote voltage control: off VS but not at its limits, a group starts sharing (GAP-015)" begin
+    # The free stored state with VS moved 0.01 above it: X is off VS, but no plant is at a limit,
+    # so the group starts sharing at VS and the solve takes X there.
+    sys = _rv_stored(; units = _RV_AB)
+    for g in get_components(ThermalStandard, sys)
+        get_ext(g)["VS"] = 1.03
+    end
+    data = PowerFlowData(ACPolarPowerFlow(; check_reactive_power_limits = true), sys)
+    bl = PF.get_bus_lookup(data)
+    @test data.bus_type[bl[3], 1] == ACBusTypes.PV
+    @test data.bus_magnitude[bl[3], 1] == 1.03
+    @test solve_power_flow!(data)
+    @test _rv_v(data, bl, 3) ≈ 1.03 atol = 1e-9
+    @test all(s == 0 for (_, _, s) in PF.get_remote_voltage_status(data)[3])
+end
+
+@testset "remote voltage control: non-generator injections at a plant's bus are not shared (GAP-015)" begin
+    # X has its own plant and a Source injecting fixed reactive power: the plant (X's generators)
+    # shares with the remote one; the Source's Q stays as stored and outside Q_tot.
+    own = [(bus = 3, ireg = 0, rmpct = 50.0, qmin = -3.0, qmax = 3.0),
+        (bus = 2, ireg = 3, rmpct = 50.0, qmin = -3.0, qmax = 3.0)]
+    sys = _rv_system(; units = own, x_type = ACBusTypes.PV, x_vm = 1.02)
+    src = _add_simple_source!(sys, get_bus(sys, 3), 0.0, 0.0)
+    PSY.with_units_base(sys, PSY.UnitSystem.SYSTEM_BASE) do
+        set_reactive_power!(src, 0.2)
+    end
+    data = PowerFlowData(ACPolarPowerFlow(), sys)
+    grp = only(PF.get_remote_voltage_groups(data))
+    X = grp.regulated_ix
+    rvc = data.remote_voltage_control
+    @test rvc.q_fixed[grp.offset + 1, 1] ≈ 0.2 atol = 1e-12   # X's row: the Source
+    @test rvc.q_fixed[grp.offset + 2, 1] ≈ 0.0 atol = 1e-12
+    @test PF.calculate_x0(data, 1)[2X - 1] ≈ 0.0 atol = 1e-12  # plants' stored Q (0 each)
+    @test solve_power_flow!(data)
+    bl = PF.get_bus_lookup(data)
+    @test _rv_v(data, bl, 3) ≈ 1.02 atol = 1e-9
+    @test _rv_q(data, bl, 3) - 0.2 ≈ _rv_q(data, bl, 2) rtol = 1e-9
 end
