@@ -113,4 +113,5 @@ include("RobustHomotopy/HessianSolver/fixed_structure_CHOLMOD.jl")
 include("RobustHomotopy/HessianSolver/cholesky_solver.jl")
 include("RobustHomotopy/homotopy_hessian.jl")
 include("RobustHomotopy/robust_homotopy_method.jl")
+include("precompile.jl")
 end
