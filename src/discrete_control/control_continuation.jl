@@ -1347,7 +1347,7 @@ _restore_area_dp(data, ts::Int) =
 # status (the failed solve's state was restored from the snapshot taken just before it), no
 # parameter moved since, and the same area ΔP (held in `failed[]`). A device with no parameter
 # to walk would solve again from that start, which is the same computation and fails the same
-# way, leaving `data` as it found it; so it returns `false` without solving. On a WECC-size case
+# way, leaving `data` as it found it; so it returns `false` without solving. On a large case
 # whose snapped network does not solve for a reason no one device explains, the walk otherwise
 # runs one capped solve per enrolled device (thousands). `nothing` (the default): no reuse.
 function _restore_one!(
