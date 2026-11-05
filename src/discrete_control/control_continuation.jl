@@ -1200,15 +1200,17 @@ end
 # CONTROL_FINISH_SOLVE_TOL (T152): at the caller's tolerance a step smaller than it was taken
 # without a Newton iteration, so the finish read the voltage from before its step and stopped
 # wherever its last round left it, off its target by up to dV/dQ times that tolerance. A
-# banded shunt never retreats past its anchor (`_band_clamp`). A failed round rolls back to the
-# last converged state with a warning.
+# banded shunt never retreats past its anchor (`_band_clamp`), and a latched one on GAP-056's
+# hold band ends half the band inside its edge (`finish_margin`). A failed round rolls back to
+# the last converged state with a warning.
 
 # The quantity a continuous device is held to at the end, or `nothing` when it is not
-# regulating (a discrete shunt, or one held inside a nonzero band).
+# regulating (a discrete shunt, or one held inside a nonzero band). A latched banded device ends
+# `finish_margin` inside the edge it latched on (GAP-056's hold band: half the band; T152).
 function _continuous_target(d::ControlledSwitchedShunt)
     d.continuous || return nothing
     d.vset_lo == d.vset_hi && return d.vset
-    d.band && d.side != 0 && return control_setpoint(d)
+    d.band && d.side != 0 && return control_setpoint(d) - d.side * d.finish_margin
     return nothing
 end
 _continuous_target(d::ControlledFACTS) = d.vset

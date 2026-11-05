@@ -70,6 +70,14 @@ const CONTROL_FACTS_SETPOINT_BAND = 1e-3
 # setpoint (VSWLO = VSWHI) whose regulated bus another device also regulates (GAP-056, see
 # `_share_regulated_setpoints!`): the same "at setpoint" width as FACTS classification.
 const CONTROL_SHARED_SETPOINT_BAND = CONTROL_FACTS_SETPOINT_BAND
+# How far inside the edge it latched on such a device finishes once it has had to act
+# (`_continuous_target`): half the band, midway between the edge and the setpoint. On the edge
+# itself it sits exactly at the band's width from its setpoint, so any later perturbation of its
+# bus (a solve's tolerance, a neighbour's Q-limit state) reads as off its setpoint by more than
+# the band on one run and less on the next. Half the band is the widest margin that still leaves
+# the setpoint to the bus's other regulators (the reason for the band) and keeps the device as
+# far from the edge as from the setpoint.
+const CONTROL_SHARED_FINISH_MARGIN = CONTROL_SHARED_SETPOINT_BAND / 2
 # "At the |b| bound" tolerance for the same classification, RELATIVE to the bound: the final
 # clamped `current` can sit a small fraction below the last-refreshed `b_lim` (the bound is
 # refreshed from the final voltage after the last clamp), so an absolute settle tolerance is

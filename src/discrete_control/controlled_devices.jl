@@ -195,9 +195,11 @@ Voltage band (PSS/E `[VSWLO, VSWHI]`, `vset_lo`/`vset_hi`): the shunt is held wh
 regulated voltage is inside. With `band` set, one outside latches the violated edge (`side`
 −1 below, +1 above, `anchor` the susceptance where it latched), regulates toward it, and a
 discrete shunt stops at the first level inside (directional snap, then `_band_settle!`); a
-continuous one ends on the edge. Without `band` (`shunt_voltage_band = false`, the rule before
-the band was implemented) it regulates toward `vset`, the band midpoint, is held as soon as its
-voltage crosses into the band, and snaps to the nearest level."""
+continuous one ends `finish_margin` inside the edge (0, on the edge, for a PSS/E band; half the
+band for GAP-056's hold band, `_share_regulated_setpoints!`). Without `band`
+(`shunt_voltage_band = false`, the rule before the band was implemented) it regulates toward
+`vset`, the band midpoint, is held as soon as its voltage crosses into the band, and snaps to the
+nearest level."""
 mutable struct ControlledSwitchedShunt <: AbstractShuntControl
     name::String
     bus_ix::Int
@@ -223,7 +225,19 @@ mutable struct ControlledSwitchedShunt <: AbstractShuntControl
     band::Bool                       # PSS/E band: first level inside; false ⇒ midpoint rule
     side::Int                        # latched violation: −1 below, +1 above, 0 none
     anchor::Float64                  # susceptance where the current latch began
+    finish_margin::Float64           # continuous: how far inside a latched edge it finishes
 end
+
+# Positional form without the finish margin (a PSS/E band: a continuous device ends on the edge).
+ControlledSwitchedShunt(
+    name, bus_ix, controlled_ix, vset, vset_lo, vset_hi, g0, b0, block_steps, block_dB,
+    b_min, b_max, block_n, continuous, initial, current, psse_convention, levels,
+    level_blocks, band, side, anchor,
+) = ControlledSwitchedShunt(
+    name, bus_ix, controlled_ix, vset, vset_lo, vset_hi, g0, b0, block_steps, block_dB,
+    b_min, b_max, block_n, continuous, initial, current, psse_convention, levels,
+    level_blocks, band, side, anchor, 0.0,
+)
 
 # Positional form without the level table and band (unit tests, older callers): the PSS/E
 # ADJM = 0 chains, and the midpoint rule.
@@ -233,7 +247,7 @@ ControlledSwitchedShunt(
 ) = ControlledSwitchedShunt(
     name, bus_ix, controlled_ix, vset, vset_lo, vset_hi, g0, b0, block_steps, block_dB,
     b_min, b_max, block_n, continuous, initial, current, psse_convention,
-    _shunt_levels(b0, block_steps, block_dB, 0)..., false, 0, current,
+    _shunt_levels(b0, block_steps, block_dB, 0)..., false, 0, current, 0.0,
 )
 
 """`(levels, level_blocks)` of a switched shunt with fixed base `b0`: the realizable total

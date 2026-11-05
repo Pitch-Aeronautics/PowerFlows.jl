@@ -1970,7 +1970,7 @@ end
 # represent. Continuous MODSW 2 shunts with a point setpoint `vset` (VSWLO = VSWHI): "X_Z2" at X
 # (`strong`) and "Y_Z2" at Y regulating X remotely (`weak`), as the PSS/E parser builds them.
 function _shared_bus_system(; vset = 1.0, ireg = false, strong = true, weak = true,
-    bx = 0.2, by = 0.1)
+    bx = 0.2, by = 0.1, discrete = false, x_increase = 0.5)
     sys = System(100.0)
     b1 = _add_simple_bus!(sys, 1, ACBusTypes.REF, 230, 1.0, 0.0)
     _add_simple_source!(sys, b1, 0.0, 0.0)
@@ -1985,15 +1985,23 @@ function _shared_bus_system(; vset = 1.0, ireg = false, strong = true, weak = tr
     g = _add_simple_thermal_standard!(sys, bg, 0.5, 0.0)
     set_reactive_power_limits!(g, (min = -3.0, max = 3.0))
     ireg && (get_ext(g)["IREG"] = 3)
-    for (nm, bus, b, reg, on) in (("X_Z2", bx_, bx, 0, strong), ("Y_Z2", by_, by, 3, weak))
+    for (nm, bus, b, reg, on, inc) in (("X_Z2", bx_, bx, 0, strong, x_increase),
+        ("Y_Z2", by_, by, 3, weak, 0.5))
         on || continue
         add_component!(sys, SwitchedAdmittance(; name = nm, available = true, bus = bus,
-            Y = b * im, initial_status = [0], number_of_steps = [1], Y_increase = [0.5im],
+            Y = b * im, initial_status = [0], number_of_steps = [1], Y_increase = [inc * im],
             admittance_limits = (min = vset, max = vset),
             control_mode = PSY.SwitchedAdmittanceControlMode.CONTINUOUS_VOLTAGE,
             regulated_bus_number = reg,
             ext = Dict{String, Any}("MODSW" => 2, "ADJM" => 0, "RMPCT" => 100.0)))
     end
+    # `discrete`: a MODSW 1 shunt "X_Z1" at X beside X_Z2, its band wide enough to hold it at
+    # its stored step (the shape of a continuous device sharing its bus with discrete ones).
+    discrete && add_component!(sys, SwitchedAdmittance(; name = "X_Z1", available = true,
+        bus = bx_, Y = 0.0im, initial_status = [0], number_of_steps = [2],
+        Y_increase = [0.05im], admittance_limits = (min = 0.9, max = 1.1),
+        control_mode = PSY.SwitchedAdmittanceControlMode.DISCRETE_VOLTAGE,
+        regulated_bus_number = 0, ext = Dict{String, Any}("MODSW" => 1, "ADJM" => 0)))
     return sys
 end
 
@@ -2061,13 +2069,62 @@ end
     # susceptance, 5 MVAr each).
     sh, v, _ = _shared_bus_solve(; vset = round(v0; digits = 6))
     @test all(d.current == d.initial for d in values(sh))
-    # 2δ below the setpoint: they regulate, and end inside the band (on an edge: the
-    # continuation's early, shallow stages carry a band this narrow across it).
+    # 2δ below the setpoint: they regulate, and end inside the band, half the band inside the
+    # edge they latched on (T152; before, on the edge itself: the continuation's early, shallow
+    # stages carry a band this narrow across it, so either edge)
+    m = PowerFlows.CONTROL_SHARED_FINISH_MARGIN
     vset = round(v0 + 2δ; digits = 6)
     sh, v, _ = _shared_bus_solve(; vset = vset)
     @test all(d.current > d.initial for d in values(sh))
-    @test vset - δ - 1e-6 <= v <= vset + δ + 1e-6
-    @test min(abs(v - (vset - δ)), abs(v - (vset + δ))) < 1e-6
+    @test all(d.finish_margin == m for d in values(sh))
+    @test abs(v - vset) <= δ - m + 1e-6
+    @test min(abs(v - (vset - δ + m)), abs(v - (vset + δ - m))) < 1e-6
+end
+
+# T152 (GAP-078): rule S of the consumer scores a continuous shunt as off its setpoint past 1e-3
+# p.u., the hold band's own width, so a device that ended on the band's edge read 0.99e-3 on one
+# run and 1.01–1.03e-3 on the next. A latched hold-band device now ends half the band inside
+# the edge; a device at its limit cannot, and stays there; a PSS/E band (VSWLO < VSWHI) keeps
+# PSS/E's edge; and the discrete device beside it lands where it did.
+@testset "shared regulated bus: a continuous shunt beside a discrete one finishes inside its hold band (GAP-056, T152)" begin
+    δ = PowerFlows.CONTROL_SHARED_SETPOINT_BAND
+    m = PowerFlows.CONTROL_SHARED_FINISH_MARGIN
+    @test m == δ / 2
+    v0, _ = _shared_bus_stored(; weak = false, discrete = true)
+    for (off, side) in ((2δ, -1), (3δ, -1), (-2δ, 1))
+        vset = round(v0 + off; digits = 6)
+        sh, v, _ = _shared_bus_solve(; weak = false, discrete = true, vset = vset)
+        c, d = sh["X_Z2"], sh["X_Z1"]
+        @test c.band && c.side == side && c.finish_margin == m
+        @test c.current != c.initial                         # it acted, as before
+        @test v - vset ≈ side * (δ - m) atol = 1e-8           # half the band inside, not on the edge
+        @test d.current == d.initial && d.finish_margin == 0.0   # the discrete one unmoved
+    end
+end
+
+@testset "shared regulated bus: a continuous shunt at its limit stays there, outside its hold band (GAP-056, T152)" begin
+    δ = PowerFlows.CONTROL_SHARED_SETPOINT_BAND
+    kw = (; weak = false, discrete = true, bx = 0.0, x_increase = 0.01)
+    v0, _ = _shared_bus_stored(; kw...)
+    vset = round(v0 + 4δ; digits = 6)
+    sh, v, _ = _shared_bus_solve(; kw..., vset = vset)
+    c = sh["X_Z2"]
+    @test c.current == c.b_max                              # railed
+    @test v < vset - δ                                      # it cannot reach its band
+end
+
+@testset "continuous shunt with a PSS/E band (VSWLO < VSWHI) still ends on its edge (T152)" begin
+    v0, _ = _shared_bus_stored(; weak = false)
+    sys = _shared_bus_system(; weak = false)
+    sa = get_component(PSY.SwitchedAdmittance, sys, "X_Z2")
+    lo = round(v0 + 0.005; digits = 6)
+    PSY.set_admittance_limits!(sa, (min = lo, max = lo + 0.01))
+    data = PowerFlowData(
+        ACPolarPowerFlow(; control_discrete_devices = true, remote_voltage_control = false), sys)
+    @test solve_power_flow!(data)
+    sh = only(PF.get_controlled_devices(data).shunts)
+    @test sh.band && sh.side == -1 && sh.finish_margin == 0.0
+    @test data.bus_magnitude[PF.get_bus_lookup(data)[3], 1] ≈ lo atol = 1e-8
 end
 
 # T152: the exact finish solves at CONTROL_FINISH_SOLVE_TOL, not at the caller's tolerance. At a

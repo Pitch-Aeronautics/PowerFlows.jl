@@ -650,8 +650,10 @@ end
 (VSWLO = VSWHI) whose regulated bus is also regulated by another enrolled device (a tap, shunt
 or FACTS) or by a generator by IREG (`_generator_remote_bus`) is given a hold band of
 ±`CONTROL_SHARED_SETPOINT_BAND` around its setpoint: it keeps its stored susceptance while the
-voltage is inside, and outside it regulates to the nearer edge and ends there (the band rule of
-a banded continuous shunt).
+voltage is inside, and outside it regulates toward the nearer edge and ends
+`CONTROL_SHARED_FINISH_MARGIN` (half the band) inside it (`finish_margin`; T152, GAP-078: ending
+on the edge put it exactly the band's width from its setpoint, so a check of "off its setpoint by
+more than the band" turned on the last digits of a solve).
 
 Why: with a point setpoint the sigmoid law drives every such shunt to the susceptance its
 voltage error maps to, whatever it stored, and the exact finish then puts the bus on its
@@ -686,6 +688,7 @@ function _share_regulated_setpoints!(shunts, taps, facts, sys, bus_lookup,
         d.vset_lo = d.vset - δ
         d.vset_hi = d.vset + δ
         d.band = band
+        d.finish_margin = CONTROL_SHARED_FINISH_MARGIN
         @debug "ControlledSwitchedShunt $(d.name): regulated bus shared with another \
             device; held within ±$δ p.u. of its setpoint."
     end
