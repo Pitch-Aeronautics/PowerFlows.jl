@@ -1310,22 +1310,46 @@ function _continuous_finish!(
     return true
 end
 
+# The area-interchange ΔP column at time step `ts` (empty without enrolled areas). Every residual
+# evaluation writes it, and `ControlStateSnapshot` does not hold it, so a failed solve can leave it
+# changed; `_restore_one!` compares it before reusing a failed solve's outcome.
+_restore_area_dp(data, ts::Int) =
+    iszero(n_controlled_areas(data)) ? Float64[] :
+    data.area_interchange.delta_p[:, ts]
+
 # Incremental λ-restore of one device from its snapped value toward the
 # continuous value (used only if snapping made the system infeasible).  First
 # probe is a SMALL step, matching `_continuation_to!`.
+#
+# `failed` carries, across one restore walk, the start of the walk's last failed solve when
+# `data` is still exactly there: the same voltages, bus types, injections and remote-regulation
+# status (the failed solve's state was restored from the snapshot taken just before it), no
+# parameter moved since, and the same area ΔP (held in `failed[]`). A device with no parameter
+# to walk would solve again from that start, which is the same computation and fails the same
+# way, leaving `data` as it found it; so it returns `false` without solving. On a WECC-size case
+# whose snapped network does not solve for a reason no one device explains, the walk otherwise
+# runs one capped solve per enrolled device (thousands). `nothing` (the default): no reuse.
 function _restore_one!(
-    d, data, ts::Int, continuous::Float64, pf, snap::ControlStateSnapshot; kwargs...,
+    d, data, ts::Int, continuous::Float64, pf, snap::ControlStateSnapshot,
+    failed::Base.RefValue{Union{Nothing, Vector{Float64}}} =
+        Ref{Union{Nothing, Vector{Float64}}}(nothing);
+    kwargs...,
 )::Bool
     snapped = current_parameter(d)
     if abs(continuous - snapped) < _param_tol(d)
+        dp = _restore_area_dp(data, ts)
+        failed[] == dp && return false
         # No parameter to walk, but the solve can still fail (another device's snap
         # made the network infeasible): protect it like every other solve path so a
         # diverged iterate never leaks into the next device's "last converged" snapshot.
         _capture_state!(snap, data, ts)
         ok = _ctrl_solve!(pf, data, ts; kwargs...)
         ok || _restore_state!(data, ts, snap)
+        failed[] = ok ? nothing : dp
         return ok
     end
+    # A parameter moves below (even a reverted move is a Y-bus delta update): no reuse after it.
+    failed[] = nothing
     lo, hi = parameter_limits(d)
     _capture_state!(snap, data, ts)  # last converged state, restored on a failed trial
     # Full move first, matching `_continuation_to!`.
@@ -1368,14 +1392,17 @@ function _snap_device_group!(devices, data, ts::Int, dVdp = nothing, goffset::In
 end
 
 # λ-restore a concrete device vector toward its stashed continuous value; returns `true`
-# iff all restored to a converged state.
+# iff all restored to a converged state. `failed`: see `_restore_one!`.
 function _restore_device_group!(
     devices, data, ts::Int, cont::Vector{Float64}, pf,
-    scratch_snap::ControlStateSnapshot; kwargs...,
+    scratch_snap::ControlStateSnapshot,
+    failed::Base.RefValue{Union{Nothing, Vector{Float64}}} =
+        Ref{Union{Nothing, Vector{Float64}}}(nothing);
+    kwargs...,
 )::Bool
     ok = true
     for (i, d) in enumerate(devices)
-        ok &= _restore_one!(d, data, ts, cont[i], pf, scratch_snap; kwargs...)
+        ok &= _restore_one!(d, data, ts, cont[i], pf, scratch_snap, failed; kwargs...)
     end
     return ok
 end
@@ -1761,13 +1788,16 @@ function snap_and_restore!(
         return true
     end
     _restore_state!(data, ts, pre)
-    ok = _restore_device_group!(set.taps, data, ts, cont_taps, pf, scratch_snap; kwargs...)
+    # One record of the walk's last failed start, across the four families (`_restore_one!`).
+    failed = Ref{Union{Nothing, Vector{Float64}}}(nothing)
+    ok = _restore_device_group!(
+        set.taps, data, ts, cont_taps, pf, scratch_snap, failed; kwargs...)
     ok &= _restore_device_group!(
-        set.shunts, data, ts, cont_shunts, pf, scratch_snap; kwargs...)
+        set.shunts, data, ts, cont_shunts, pf, scratch_snap, failed; kwargs...)
     ok &= _restore_device_group!(
-        set.facts, data, ts, cont_facts, pf, scratch_snap; kwargs...)
+        set.facts, data, ts, cont_facts, pf, scratch_snap, failed; kwargs...)
     ok &= _restore_device_group!(
-        set.phase_shifters, data, ts, cont_psts, pf, scratch_snap; kwargs...)
+        set.phase_shifters, data, ts, cont_psts, pf, scratch_snap, failed; kwargs...)
     if !ok
         names = join(
             vcat(
