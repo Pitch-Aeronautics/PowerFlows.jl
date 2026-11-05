@@ -565,7 +565,97 @@ function _q_limit_return!(data::ACPowerFlowData, st::QLimitSwitchState, ix::Int,
     data.bus_magnitude[ix, ts] = vset
     push!(st.returned_this_loop, key)
     st.returns[] += 1
+    key in st.stored_starts && push!(st.stored_start_returns, key)
     return true
+end
+
+"""Tolerance (p.u. Q, 0.01 MVAr on a 100 MVA base) within which a local unit's stored reactive
+power counts as at its limit for `_start_local_units_at_stored_limits!`. Tight on purpose: PSS/E
+writes a unit that cannot hold its setpoint exactly at its limit, so a unit off its setpoint and
+further from its limit than this is a stored state to report, not one to start from."""
+const STORED_Q_LIMIT_TOLERANCE = 1e-4
+
+_stored_limit_start_enabled(pf::PowerFlowEvaluationModel) =
+    get_start_at_stored_q_limits(pf) && pf.check_reactive_power_limits
+_stored_limit_start_enabled(::ACPolarPowerFlow{<:FastDecoupledACPowerFlow}) = false
+
+"""The scheduled voltage of the local units at each bus index: the units' VS when every available
+generator at the bus regulates that bus and states the same VS, and those units account for the
+bus's Q bounds. A bus that fails this is absent from the result: without its own VS a unit has no
+side to be on, and the VS of a unit with a remote IREG belongs to the bus it regulates."""
+function _local_unit_setpoints(data, pf, sys)
+    bus_lookup = get_bus_lookup(data)
+    rmap = PNM.get_reverse_bus_search_map(
+        PNM.get_network_reduction_data(data.power_network_matrix))
+    units = Dict{Int, Vector{Any}}()
+    for g in PSY.get_available_components(PSY.Generator, sys)
+        bix = _resolve_bus_ix(bus_lookup, rmap, PSY.get_number(PSY.get_bus(g)))
+        isnothing(bix) || push!(get!(units, bix, Any[]), g)
+    end
+    setpoints = Dict{Int, Float64}()
+    for (bix, gs) in units
+        all(gs) do g
+            r = _generator_remote_bus(g)
+            isnothing(r) || _resolve_bus_ix(bus_lookup, rmap, r) == bix
+        end || continue
+        vs = [_generator_remote_setpoint(g) for g in gs]
+        any(isnothing, vs) && continue
+        maximum(vs) - minimum(vs) > REMOTE_VOLTAGE_VS_AGREEMENT && continue
+        _, lo, hi = _rv_plant_q_and_bounds(gs, pf)
+        all(ts -> begin
+                b = data.bus_reactive_power_bounds[bix, ts]
+                abs(b[1] - lo) <= BOUNDS_TOLERANCE && abs(b[2] - hi) <= BOUNDS_TOLERANCE
+            end, axes(data.bus_reactive_power_bounds, 2)) || continue
+        setpoints[bix] = first(vs)
+    end
+    return setpoints
+end
+
+"""
+    _start_local_units_at_stored_limits!(data, pf, sys)
+
+The groups' saturated start (`_rv_stored_saturation`), for single units. Limits apply only after a
+converged solve, but a local unit stored at a Q limit on PSS/E's side of its VS is PQ in PSS/E
+(VARLIM 0) from the first iteration. Held PV at its stored |V| it can screen a remote-regulation
+group's regulated bus from the group's plants, so that the Jacobian has no route from the group's
+Q total to that bus's row, and the first solve never converges.
+
+So such a bus starts PQ at the limit, with its VS kept as its setpoint for `_q_limit_return!`:
+Qmax with |V| below VS, or Qmin with |V| above it, within `STORED_Q_LIMIT_TOLERANCE` of the limit.
+A unit the solve moves across its VS returns to PV there. The final state is consistent with
+VARLIM whichever way the start was read: at a limit on the near side of VS, or PV at VS.
+
+Reads `data` as built, so the stored Q and stored |V|: with `start_at_stored_q_limits = false` (or
+Q limits off, or a fast decoupled solver) every such unit stays PV at its stored |V| and limits
+apply after a converged solve. Leaves alone a bus in a remote-regulation group, and a bus whose
+units do not all state the same VS for themselves (`_local_unit_setpoints`). Called once, at build,
+after `_enroll_remote_voltage_control!`.
+"""
+function _start_local_units_at_stored_limits!(data, pf, sys)
+    _stored_limit_start_enabled(pf) || return
+    setpoints = _local_unit_setpoints(data, pf, sys)
+    isempty(setpoints) && return
+    st = data.q_limit_switches
+    rvc = data.remote_voltage_control
+    tol = Q_LIMIT_RETURN_VOLTAGE_TOLERANCE
+    for (ix, vs) in setpoints, ts in axes(data.bus_type, 2)
+        data.bus_type[ix, ts] == PSY.ACBusTypes.PV || continue
+        _rv_role(rvc, ix) && continue
+        V = data.bus_magnitude[ix, ts]
+        Q = data.bus_reactive_power_injections[ix, ts]
+        lo, hi = data.bus_reactive_power_bounds[ix, ts]
+        lim = V < vs - tol ? hi : V > vs + tol ? lo : NaN
+        (isfinite(lim) && abs(Q - lim) <= STORED_Q_LIMIT_TOLERANCE) || continue
+        key = (ix, ts)
+        st.vset[key] = vs
+        push!(st.stored_starts, key)
+        data.bus_type[ix, ts] = PSY.ACBusTypes.PQ
+        data.bus_reactive_power_injections[ix, ts] = lim
+    end
+    n = count(k -> k[2] == 1, st.stored_starts)
+    n > 0 && @info "Q limits: $n local unit bus(es) start PQ at the limit they are stored at, \
+        on PSS/E's side of their scheduled voltage."
+    return
 end
 
 function bus_type_idx(

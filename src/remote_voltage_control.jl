@@ -305,7 +305,7 @@ function _enroll_remote_voltage_control!(data, pf, sys)
         setpoints = [(share[b], vs[b]) for b in members if !isnothing(vs[b])]
         if !isempty(setpoints)
             vset = last(argmax(first, setpoints))
-            if any(abs(v - vset) > 1e-4 for (_, v) in setpoints)
+            if any(abs(v - vset) > REMOTE_VOLTAGE_VS_AGREEMENT for (_, v) in setpoints)
                 @warn "Plants regulating bus $(numbers[X]) disagree on its scheduled \
                     voltage (VS); using $vset, the largest share's." maxlog = PF_MAX_LOG
             end
@@ -378,6 +378,9 @@ function _enroll_remote_voltage_control!(data, pf, sys)
         $(sum(grp -> count(!=(grp.regulated_ix), grp.members), groups)) remote plant(s)."
     return
 end
+
+"""How far apart (p.u. |V|) units' scheduled voltages for one bus may be and still count as one."""
+const REMOTE_VOLTAGE_VS_AGREEMENT = 1e-4
 
 """Tolerance (p.u. Q, 1 MVAr on a 100 MVA base) within which a plant's stored reactive power
 counts as at its limit for `_rv_stored_saturation`."""

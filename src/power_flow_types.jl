@@ -36,13 +36,18 @@ abstract type SolverCache end
 - `flip_flops`: returns to PV that the next solve of the same Q-limit loop undid, in the current
   time step's solve; `capped` holds the buses that reached `MAX_Q_LIMIT_FLIP_FLOPS` and stay PQ.
 - `returned_this_loop`: the buses returned to PV in the running Q-limit loop.
-- `returns`: PQ→PV returns over the data's life (a diagnostic)."""
+- `returns`: PQ→PV returns over the data's life (a diagnostic).
+- `stored_starts`: the buses that started PQ at a limit they are stored at
+  (`_start_local_units_at_stored_limits!`); their `vset` is the units' VS, not the stored |V|.
+- `stored_start_returns`: those of them the check has returned to PV at least once."""
 struct QLimitSwitchState
     vset::Dict{Tuple{Int, Int}, Float64}
     flip_flops::Dict{Tuple{Int, Int}, Int}
     capped::Set{Tuple{Int, Int}}
     returned_this_loop::Set{Tuple{Int, Int}}
     returns::Base.RefValue{Int}
+    stored_starts::Set{Tuple{Int, Int}}
+    stored_start_returns::Set{Tuple{Int, Int}}
 end
 QLimitSwitchState() = QLimitSwitchState(
     Dict{Tuple{Int, Int}, Float64}(),
@@ -50,6 +55,8 @@ QLimitSwitchState() = QLimitSwitchState(
     Set{Tuple{Int, Int}}(),
     Set{Tuple{Int, Int}}(),
     Ref(0),
+    Set{Tuple{Int, Int}}(),
+    Set{Tuple{Int, Int}}(),
 )
 
 """Memoized AC-Jacobian sparse structure, stored in its OWN `PowerFlowData` field (not the shared
@@ -473,6 +480,12 @@ with the specified solver type.
     PQ when all are). Has no effect when no generator names a remote bus. Not supported by the
     fast decoupled solvers (each unit then holds its own terminal, with a warning). `false`
     makes every generator hold its own terminal. Default is `true`.
+- `start_at_stored_q_limits::Bool`: With `check_reactive_power_limits`, a bus whose local units
+    state their scheduled voltage (`VS` in `ext` or `ext["psse"]`) and are stored at a Q limit on
+    PSS/E's side of it (Qmax with |V| below VS, Qmin with |V| above) starts PQ at that limit, VS
+    kept as its setpoint, instead of PV at its stored |V| until a converged solve. It reads the
+    stored Q and |V|, so `false` is for a solve that must not. Has no effect without `VS`, or on
+    the fast decoupled solvers. Default is `true`.
 - `solver_settings::Dict{Symbol, Any}`: Additional keyword arguments to pass to the solver.
     Default is an empty dictionary.
 """
@@ -504,6 +517,7 @@ struct ACPolarPowerFlow{ACSolver <: ACPowerFlowSolverType} <: AbstractACPowerFlo
     interchange_tolerance::Float64
     tie_definition::Symbol
     remote_voltage_control::Bool
+    start_at_stored_q_limits::Bool
     solver_settings::Dict{Symbol, Any}
 end
 
@@ -568,6 +582,7 @@ function ACPolarPowerFlow{ACSolver}(;
     interchange_tolerance::Float64 = DEFAULT_INTERCHANGE_TOLERANCE,
     tie_definition::Symbol = :lines_only,
     remote_voltage_control::Bool = true,
+    start_at_stored_q_limits::Bool = true,
     solver_settings::AbstractDict = Dict{Symbol, Any}(),
 ) where {ACSolver <: ACPowerFlowSolverType}
     settings = Dict{Symbol, Any}(solver_settings)
@@ -612,6 +627,7 @@ function ACPolarPowerFlow{ACSolver}(;
         validated_interchange_tolerance,
         tie_definition,
         remote_voltage_control,
+        start_at_stored_q_limits,
         settings,
     )
 end
@@ -660,6 +676,8 @@ get_phase_shifter_control(pf::AbstractACPowerFlow) = pf.phase_shifter_control
 get_phase_shifter_control(::PowerFlowEvaluationModel) = true
 get_remote_voltage_control(pf::ACPolarPowerFlow) = pf.remote_voltage_control
 get_remote_voltage_control(::PowerFlowEvaluationModel) = false
+get_start_at_stored_q_limits(pf::ACPolarPowerFlow) = pf.start_at_stored_q_limits
+get_start_at_stored_q_limits(::PowerFlowEvaluationModel) = false
 
 get_area_interchange_control(pf::AbstractACPowerFlow) = pf.area_interchange_control
 get_area_interchange_control(::PowerFlowEvaluationModel) = false

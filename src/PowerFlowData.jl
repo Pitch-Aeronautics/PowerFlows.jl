@@ -243,6 +243,15 @@ get_q_limit_return_count(pfd::PowerFlowData) = pfd.q_limit_switches.returns[]
 """Indices of the buses that hit the flip-flop cap (`MAX_Q_LIMIT_FLIP_FLOPS`) at `time_step`."""
 get_q_limit_capped_buses(pfd::PowerFlowData, time_step::Int = 1) =
     sort!([ix for (ix, ts) in pfd.q_limit_switches.capped if ts == time_step])
+"""Indices of the buses that started PQ at a stored Q limit at `time_step`
+(`start_at_stored_q_limits`, `_start_local_units_at_stored_limits!`)."""
+get_q_limit_stored_start_buses(pfd::PowerFlowData, time_step::Int = 1) =
+    sort!([ix for (ix, ts) in pfd.q_limit_switches.stored_starts if ts == time_step])
+"""Indices of the buses of [`get_q_limit_stored_start_buses`](@ref) the reactive-limit check has
+returned to PV at least once at `time_step` (a rolled-back trial's return counts: the bus's type
+in `get_bus_type` says where it ended)."""
+get_q_limit_stored_start_returned_buses(pfd::PowerFlowData, time_step::Int = 1) =
+    sort!([ix for (ix, ts) in pfd.q_limit_switches.stored_start_returns if ts == time_step])
 get_bus_magnitude(pfd::PowerFlowData) = pfd.bus_magnitude
 get_bus_angles(pfd::PowerFlowData) = pfd.bus_angles
 get_arc_active_power_flow_from_to(pfd::PowerFlowData) =
@@ -602,6 +611,7 @@ function make_and_initialize_power_flow_data(
     @assert length(data.lcc.setpoint_at_rectifier) == n_lccs
     initialize_power_flow_data!(data, pf, sys; correct_bustypes = get_correct_bustypes(pf))
     _enroll_remote_voltage_control!(data, pf, sys)
+    _start_local_units_at_stored_limits!(data, pf, sys)
     _debit_facts_warm_start!(data, controlled_devices)
     return data
 end
