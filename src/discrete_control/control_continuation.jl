@@ -107,10 +107,15 @@ end
 end
 
 # Counting wrapper around the inner solve: iteration counts are the repo's robust
-# performance metric, and the continuation's cost IS its inner-solve count.
+# performance metric, and the continuation's cost IS its inner-solve count. Past the control
+# solve's time limit (`control_time_limit`) no inner solve starts: it reports a failed solve, which
+# every caller already rolls back, and the loops below stop at their next check.
 @inline function _ctrl_solve!(pf, data, ts::Int; kwargs...)
     cd = data.controlled_devices
-    isnothing(cd) || (cd.inner_solves[] += 1)
+    if !isnothing(cd)
+        _control_time_up!(cd) && return false
+        cd.inner_solves[] += 1
+    end
     return _solve_with_q_limits!(pf, data, ts; kwargs...)
 end
 
@@ -1138,6 +1143,7 @@ function _control_continuation!(
         end
         settled = false
         for _ in 1:MAX_CONTROL_PASSES_PER_STAGE
+            _control_time_up!(set) && break
             if !use_batched
                 # No context yet (the probe-phase build hit a singular Jacobian): try again at
                 # this pass's converged state, so one bad base point does not leave the whole
@@ -1153,7 +1159,7 @@ function _control_continuation!(
                 kwargs..., tol = stage_tol)
             settled && break
         end
-        if S >= MAX_CONTROL_STEEPNESS
+        if S >= MAX_CONTROL_STEEPNESS || set.time_limit_reached[]
             regulation_complete = settled
             break
         end
@@ -1392,7 +1398,8 @@ function _snap_device_group!(devices, data, ts::Int, dVdp = nothing, goffset::In
 end
 
 # λ-restore a concrete device vector toward its stashed continuous value; returns `true`
-# iff all restored to a converged state. `failed`: see `_restore_one!`.
+# iff all restored to a converged state. `failed`: see `_restore_one!`. Past the control time
+# limit the walk stops: the result is `false` whatever the remaining devices would do.
 function _restore_device_group!(
     devices, data, ts::Int, cont::Vector{Float64}, pf,
     scratch_snap::ControlStateSnapshot,
@@ -1401,7 +1408,9 @@ function _restore_device_group!(
     kwargs...,
 )::Bool
     ok = true
+    set = data.controlled_devices
     for (i, d) in enumerate(devices)
+        !isnothing(set) && _control_time_up!(set) && return false
         ok &= _restore_one!(d, data, ts, cont[i], pf, scratch_snap, failed; kwargs...)
     end
     return ok

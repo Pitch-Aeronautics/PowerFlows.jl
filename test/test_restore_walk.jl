@@ -1,4 +1,4 @@
-# The restore walk after a failed post-snap solve (T156).
+# The restore walk after a failed post-snap solve, and the control solve's time limit (T156).
 
 # IEEE 14 (PSB `c_sys14`) with eight discrete switched shunts and one FACTS, solved under discrete
 # control; then every withdrawal times `overload`, which no device setting can carry, and shunt
@@ -111,4 +111,59 @@ end
         failed; maxIterations = 8)
     @test !ok2
     @test set.inner_solves[] == 1
+end
+
+@testset "control time limit: not converged, no solve after the limit, the reason recorded (T156)" begin
+    # A solve that runs the full continuation (four discrete shunts and a FACTS), first unlimited.
+    sys = _make_ieee14_scaled_load_system(1.0)
+    for b in (9, 10, 13, 14)
+        _add_switched_shunt!(sys, b; voltage_setpoint = 1.04)
+    end
+    _add_facts_shunt!(sys, 12; voltage_setpoint = 1.05)
+    pf = ACPolarPowerFlow{NewtonRaphsonACPowerFlow}(; control_discrete_devices = true)
+    ref = PowerFlowData(pf, sys)
+    @test solve_power_flow!(ref)
+    @test !PowerFlows.get_control_time_limit_reached(ref)
+    n_ref = PowerFlows.get_control_inner_solve_count(ref)
+    @test n_ref > 5
+
+    # a generous limit changes nothing
+    data = PowerFlowData(pf, sys)
+    @test solve_power_flow!(data; control_time_limit = 3600.0)
+    @test !PowerFlows.get_control_time_limit_reached(data)
+    @test PowerFlows.get_control_inner_solve_count(data) == n_ref
+    @test data.bus_magnitude[:, 1] == ref.bus_magnitude[:, 1]
+    @test _all_parameters(PowerFlows.get_controlled_devices(data)) ==
+          _all_parameters(PowerFlows.get_controlled_devices(ref))
+    @test isinf(PowerFlows.get_controlled_devices(data).deadline[])   # disarmed after the call
+
+    # a limit already passed: no inner solve starts
+    data = PowerFlowData(pf, sys)
+    conv = @test_logs (:warn, r"time limit of 0.0 s passed") match_mode = :any begin
+        PowerFlows._ac_power_flow_with_area_relax!(data, pf, 1; control_time_limit = 0.0)
+    end
+    @test !conv
+    @test !data.converged[1]
+    @test PowerFlows.get_control_time_limit_reached(data)
+    @test PowerFlows.get_control_inner_solve_count(data) == 0
+    @test isinf(PowerFlows.get_controlled_devices(data).deadline[])
+
+    # a limit that passes mid-continuation: stops within one inner solve of it
+    d2 = PowerFlowData(pf, sys)
+    t = @elapsed solve_power_flow!(d2)                  # one full solve, compiled
+    lim = t / 4
+    data = PowerFlowData(pf, sys)
+    conv = Logging.with_logger(Logging.NullLogger()) do
+        PowerFlows._ac_power_flow_with_area_relax!(data, pf, 1; control_time_limit = lim)
+    end
+    if PowerFlows.get_control_time_limit_reached(data)
+        @test !conv
+        @test PowerFlows.get_control_inner_solve_count(data) < n_ref
+    else
+        @test conv        # a fast machine finished inside a quarter of a timed solve: no stop
+    end
+
+    # the next call without a limit clears the reason and solves as before
+    @test solve_power_flow!(data)
+    @test !PowerFlows.get_control_time_limit_reached(data)
 end
