@@ -49,6 +49,15 @@ const CONTROL_BAND_SETTLE_SWEEPS = 4
 # step clamps at a limit.
 const CONTROL_FINISH_VTOL = 1e-9
 const CONTROL_FINISH_MAX_ROUNDS = 20
+# Power-mismatch tolerance (p.u.) of the exact finish's own solves (`_continuous_finish!`), or the
+# caller's `tol` when tighter. A solve at the caller's tolerance (a PSS/E TOLN of 0.1 MVA is
+# 1e-3 p.u.) accepts a device's step without a Newton iteration whenever the step's own
+# mismatch, |Δb|·V², is below that tolerance, so the voltage the next round reads is the one
+# before the step: the finish then cannot see its target to better than dV/dQ · tol, which at a
+# weak bus (dV/dQ of a few p.u. per p.u.) is the order of the tolerance itself. At 1e-8 the
+# voltage a round reads is the network's to a few 1e-8 p.u. there; a step whose own mismatch is
+# below this is not taken (the device has finished as closely as a solve can tell).
+const CONTROL_FINISH_SOLVE_TOL = 1e-8
 # Rail snap (`_damped_target!`): a continuous device saturating toward a bound is put on it once
 # it is within this fraction of its range of the bound.
 const CONTROL_RAIL_SNAP_REACH = 0.1

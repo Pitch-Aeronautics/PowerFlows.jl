@@ -2070,6 +2070,29 @@ end
     @test min(abs(v - (vset - δ)), abs(v - (vset + δ))) < 1e-6
 end
 
+# T152: the exact finish solves at CONTROL_FINISH_SOLVE_TOL, not at the caller's tolerance. At a
+# coarse tolerance a finish step whose own mismatch |Δb|·V² is below it was accepted without a
+# Newton iteration, so the next round read the voltage from before the step, and a lone continuous
+# shunt with a point setpoint ended off it by the order of dV/dQ · tol. (Offsets the continuation
+# carries without freezing the device: a frozen device is not finished at all.)
+@testset "exact finish: a continuous shunt reaches its point setpoint under a coarse solve tolerance (T152)" begin
+    v0, _ = _shared_bus_stored(; weak = false)
+    for off in (1e-2, -1e-2, -3e-3)
+        vset = round(v0 + off; digits = 6)
+        data = PowerFlowData(
+            ACPolarPowerFlow(; control_discrete_devices = true, remote_voltage_control = false,
+                solver_settings = Dict{Symbol, Any}(:tol => 5e-3)),
+            _shared_bus_system(; weak = false, vset = vset))
+        tl = Test.TestLogger(; min_level = Logging.Warn)
+        @test Logging.with_logger(() -> solve_power_flow!(data), tl)
+        @test !any(occursin("freezing device", r.message) for r in tl.logs)
+        sh = only(PF.get_controlled_devices(data).shunts)
+        @test !sh.band && sh.b_min < sh.current < sh.b_max
+        @test abs(data.bus_magnitude[PF.get_bus_lookup(data)[3], 1] - vset) < 1e-8
+    end
+    @test PowerFlows.CONTROL_FINISH_SOLVE_TOL <= 1e-8
+end
+
 # ── Band settle beside a railed shunt (GAP-030) ─────────────────────────────────────────────
 # REF(1) ─ X(2) ─ Y(3), loads at X and Y. Discrete (MODSW 1) shunts: capacitor A at X, one
 # 0.1 p.u. block, and B at Y, a reactor whose blocks `b_blocks` (one −0.5 p.u. block: levels

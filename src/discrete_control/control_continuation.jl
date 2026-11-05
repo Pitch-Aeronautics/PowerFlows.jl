@@ -1194,10 +1194,14 @@ end
 # device (a continuous switched shunt with a zero-width band or latched on an edge, and every
 # FACTS) takes undamped Newton steps on its own susceptance, b ← clamp(b − (y − y*)/(dy/db)),
 # all devices together with one joint solve per round and a secant refresh of dy/db, until
-# |y − y*| ≤ CONTROL_FINISH_VTOL or the step clamps at a limit (the device then sits exactly
-# there; a FACTS's |V|-dependent bound is refreshed every round). A banded shunt never retreats
-# past its anchor (`_band_clamp`). A failed round rolls back to the last converged state with a
-# warning.
+# |y − y*| ≤ CONTROL_FINISH_VTOL, the step clamps at a limit (the device then sits exactly
+# there; a FACTS's |V|-dependent bound is refreshed every round), or the step's own mismatch
+# |Δb|·V² is below the finish's solve tolerance. Those solves converge to
+# CONTROL_FINISH_SOLVE_TOL (T152): at the caller's tolerance a step smaller than it was taken
+# without a Newton iteration, so the finish read the voltage from before its step and stopped
+# wherever its last round left it, off its target by up to dV/dQ times that tolerance. A
+# banded shunt never retreats past its anchor (`_band_clamp`). A failed round rolls back to the
+# last converged state with a warning.
 
 # The quantity a continuous device is held to at the end, or `nothing` when it is not
 # regulating (a discrete shunt, or one held inside a nonzero band).
@@ -1217,7 +1221,7 @@ end
 
 # One Newton round's moves for one group; returns whether any device moved.
 function _finish_step_group!(devices, offset::Int, data, ts::Int, active, dVdp, n_shared,
-    prev, yprev, moved)
+    prev, yprev, moved, ftol::Float64)
     any_moved = false
     for (j, d) in enumerate(devices)
         idx = offset + j
@@ -1235,6 +1239,12 @@ function _finish_step_group!(devices, offset::Int, data, ts::Int, active, dVdp, 
         p = _band_clamp(d, p, g)
         if abs(p - d.current) <= 1e-12 * (hi - lo)
             active[idx] = false   # pinned at a limit (or its anchor): it stays there
+            continue
+        end
+        # a step inside the range below what the solve resolves: finished (a step onto a limit is
+        # still taken, so a railed device ends exactly on it)
+        if lo < p < hi && abs(p - d.current) * data.bus_magnitude[d.bus_ix, ts]^2 <= ftol
+            active[idx] = false
             continue
         end
         prev[idx] = d.current
@@ -1288,15 +1298,18 @@ function _continuous_finish!(
     prev = zeros(n)
     yprev = zeros(n)
     moved = fill(false, n)
+    # Every solve of the finish converges to CONTROL_FINISH_SOLVE_TOL (or the caller's tighter
+    # `tol`), so each round reads the voltage its steps produced (T152).
+    ftol = min(Float64(get(kwargs, :tol, DEFAULT_NR_TOL)), CONTROL_FINISH_SOLVE_TOL)
     for _ in 1:CONTROL_FINISH_MAX_ROUNDS
         fill!(moved, false)
         _capture_state!(snap, data, ts)
         any_moved = _finish_step_group!(set.shunts, n_taps, data, ts, active, dVdp, n_shared,
-            prev, yprev, moved)
+            prev, yprev, moved, ftol)
         any_moved |= _finish_step_group!(set.facts, off_facts, data, ts, active, dVdp,
-            n_shared, prev, yprev, moved)
+            n_shared, prev, yprev, moved, ftol)
         any_moved || return true
-        if !_ctrl_solve!(pf, data, ts; kwargs...)
+        if !_ctrl_solve!(pf, data, ts; kwargs..., tol = ftol)
             _finish_undo_group!(set.shunts, n_taps, data, ts, prev, moved)
             _finish_undo_group!(set.facts, off_facts, data, ts, prev, moved)
             _restore_state!(data, ts, snap)
