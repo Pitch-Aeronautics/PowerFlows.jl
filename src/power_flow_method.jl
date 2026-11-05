@@ -128,7 +128,9 @@ function _set_Δx_nr!(stateVector::StateVectorCache,
     end
 
     if use_fallback
-        @warn("$solver hit a point where the Jacobian is singular.")
+        # `nameof`, not `$solver`: printing the struct goes through `show_default`, whose edges are
+        # invalidated at load, and that throws away every cached method up the Newton chain.
+        @warn("$(nameof(typeof(solver))) hit a point where the Jacobian is singular.")
         # KLU is used because the fallback must reliably solve the regularized system. Refresh
         # values in place while the pattern holds (reusing the factorization); rebuild if it shifts.
         M_prev = stateVector.fallback_matrix[]

@@ -241,13 +241,18 @@ It preallocates memory for the results and iterates over the sorted time steps.
 solve_power_flow!(data)
 ```
 """
+# The solve chain below specializes on its keyword arguments' NamedTuple type, whose field order
+# here is a `Dict`'s iteration order (`solver_settings` merged with the call's kwargs), which follows
+# hashes and insertion history. Sorted by key, each key set has one type, however the `Dict` was built.
+_sorted_kwargs(d::AbstractDict{Symbol}) = (; (k => d[k] for k in sort!(collect(keys(d))))...)
+
 function solve_power_flow!(
     data::ACPowerFlowData;
     kwargs...,
 )
     pf = get_pf(data)
     # Merge solver_settings from pf with any explicitly passed kwargs (explicit kwargs take precedence)
-    merged_kwargs = merge(get_solver_kwargs(pf), kwargs)
+    merged_kwargs = _sorted_kwargs(merge(get_solver_kwargs(pf), kwargs))
     sorted_time_steps =
         get(merged_kwargs, :time_steps, sort(collect(keys(get_time_step_map(data)))))
     # This can be done from PSI by directly writing to `data`'s fields; we just don't
