@@ -406,8 +406,41 @@ Resets to the full pristine enrollment before each time step's attempt
 never-enrolled short-circuit deliberately tests the PRISTINE set, not the WORKING one —
 a previous time step's relax may have emptied the working set, and short-circuiting on it
 would permanently disable area control for the rest of `data`'s lifetime.
+
+`control_time_limit` (seconds; `nothing`, the default, for none) bounds a solve under discrete
+control: once that long has passed since the call, no further inner solve of the control
+continuation starts, its loops stop at their next check, no area is relaxed, and the call returns
+`false` (not converged) with `get_control_time_limit_reached(data)` true and a warning. It is
+checked only between inner solves, so one Newton solve already running finishes first. Without
+discrete control (no enrolled device) it has no effect: the solve is one Newton run, bounded by
+its iteration cap.
 """
 function _ac_power_flow_with_area_relax!(
+    data::ACPowerFlowData,
+    pf::AbstractACPowerFlow{<:ACPowerFlowSolverType},
+    time_step::Int64;
+    control_time_limit::Union{Nothing, Real} = nothing,
+    kwargs...,
+)
+    cd = data.controlled_devices
+    isnothing(cd) && return _area_relax_loop!(data, pf, time_step; kwargs...)
+    cd.time_limit_reached[] = false
+    isnothing(control_time_limit) &&
+        return _area_relax_loop!(data, pf, time_step; kwargs...)
+    cd.deadline[] = time() + Float64(control_time_limit)
+    converged = try
+        _area_relax_loop!(data, pf, time_step; kwargs...)
+    finally
+        cd.deadline[] = Inf
+    end
+    cd.time_limit_reached[] || return converged
+    @warn "discrete control: the time limit of $(control_time_limit) s passed before the \
+        control solve finished; not converged (time step $time_step)"
+    data.converged[time_step] = false
+    return false
+end
+
+function _area_relax_loop!(
     data::ACPowerFlowData,
     pf::AbstractACPowerFlow{<:ACPowerFlowSolverType},
     time_step::Int64;
@@ -422,6 +455,7 @@ function _ac_power_flow_with_area_relax!(
     while true
         converged = _ac_power_flow(data, pf, time_step; kwargs...)
         converged && break
+        get_control_time_limit_reached(data) && return false
         iszero(n_controlled_areas(data)) && break
         gaps = _area_residual_gaps(data, time_step)
         gap, worst_ix = findmax(abs, gaps)

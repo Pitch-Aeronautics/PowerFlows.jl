@@ -382,6 +382,11 @@ struct ControlledDeviceSet
     # solve or sensitivity refresh), and sensitivity-context rebuilds after a bus-type change.
     batched_fallbacks::Base.RefValue{Int}
     context_rebuilds::Base.RefValue{Int}
+    # The control solve's time limit (`control_time_limit`, see `_ac_power_flow_with_area_relax!`):
+    # the `time()` past which no further inner solve starts (Inf: none), and whether the last
+    # solve stopped there.
+    deadline::Base.RefValue{Float64}
+    time_limit_reached::Base.RefValue{Bool}
 end
 function ControlledDeviceSet(
     taps::Vector{ControlledTap},
@@ -415,6 +420,8 @@ function ControlledDeviceSet(
         Ref(0),
         Ref(0),
         Ref(0),
+        Ref(Inf),
+        Ref(false),
     )
 end
 function Base.isempty(s::ControlledDeviceSet)
@@ -493,6 +500,23 @@ performed (0 when the data was built without discrete control)."""
 function get_control_inner_solve_count(data)
     isnothing(data.controlled_devices) && return 0
     return data.controlled_devices.inner_solves[]
+end
+
+"""Whether the last discrete-control solve stopped because its time limit
+(`control_time_limit`) passed: it then returned not converged, with no inner solve started after
+the limit. `false` when the data was built without discrete control."""
+function get_control_time_limit_reached(data)
+    isnothing(data.controlled_devices) && return false
+    return data.controlled_devices.time_limit_reached[]
+end
+
+# Has the armed time limit passed? Records it on the set; one `time()` call, made only between
+# inner solves.
+@inline function _control_time_up!(set::ControlledDeviceSet)
+    isinf(set.deadline[]) && return false
+    time() >= set.deadline[] || return false
+    set.time_limit_reached[] = true
+    return true
 end
 
 """Number of KLU/AA SYMBOLIC factorizations performed inside the last discrete-control
