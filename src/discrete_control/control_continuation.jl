@@ -108,13 +108,15 @@ end
 
 # Counting wrapper around the inner solve: iteration counts are the repo's robust
 # performance metric, and the continuation's cost IS its inner-solve count. Past the control
-# solve's time limit (`control_time_limit`) no inner solve starts: it reports a failed solve, which
+# solve's time limit (`control_time_limit`), or once it has started as many inner solves as its
+# limit (`control_solve_limit`) allows, no inner solve starts: it reports a failed solve, which
 # every caller already rolls back, and the loops below stop at their next check.
 @inline function _ctrl_solve!(pf, data, ts::Int; kwargs...)
     cd = data.controlled_devices
     if !isnothing(cd)
         _control_time_up!(cd) && return false
         cd.inner_solves[] += 1
+        cd.solves_started[] += 1
     end
     return _solve_with_q_limits!(pf, data, ts; kwargs...)
 end
@@ -1159,7 +1161,7 @@ function _control_continuation!(
                 kwargs..., tol = stage_tol)
             settled && break
         end
-        if S >= MAX_CONTROL_STEEPNESS || set.time_limit_reached[]
+        if S >= MAX_CONTROL_STEEPNESS || _control_stopped(set)
             regulation_complete = settled
             break
         end

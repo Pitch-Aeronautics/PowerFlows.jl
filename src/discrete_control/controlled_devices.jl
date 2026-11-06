@@ -387,6 +387,12 @@ struct ControlledDeviceSet
     # solve stopped there.
     deadline::Base.RefValue{Float64}
     time_limit_reached::Base.RefValue{Bool}
+    # The control solve's inner-solve limit (`control_solve_limit`): the inner solves the armed
+    # call may start (`typemax(Int)`: none), how many it has started, and whether the last solve
+    # stopped there. A count, so where it stops does not depend on the machine.
+    solve_limit::Base.RefValue{Int}
+    solves_started::Base.RefValue{Int}
+    solve_limit_reached::Base.RefValue{Bool}
 end
 function ControlledDeviceSet(
     taps::Vector{ControlledTap},
@@ -421,6 +427,9 @@ function ControlledDeviceSet(
         Ref(0),
         Ref(0),
         Ref(Inf),
+        Ref(false),
+        Ref(typemax(Int)),
+        Ref(0),
         Ref(false),
     )
 end
@@ -510,14 +519,39 @@ function get_control_time_limit_reached(data)
     return data.controlled_devices.time_limit_reached[]
 end
 
-# Has the armed time limit passed? Records it on the set; one `time()` call, made only between
+"""Whether the last discrete-control solve stopped because it had started as many inner solves as
+its limit (`control_solve_limit`) allows: it then returned not converged. `false` when the data was
+built without discrete control."""
+function get_control_solve_limit_reached(data)
+    isnothing(data.controlled_devices) && return false
+    return data.controlled_devices.solve_limit_reached[]
+end
+
+"""Number of inner solves the last discrete-control solve (`_ac_power_flow_with_area_relax!`)
+started, over every continuation it ran (area relaxes included); 0 when the data was built
+without discrete control."""
+function get_control_solves_started(data)
+    isnothing(data.controlled_devices) && return 0
+    return data.controlled_devices.solves_started[]
+end
+
+# Has the armed inner-solve limit been used up, or the armed time limit passed? Records which on
+# the set; one comparison, and one `time()` call when a time limit is armed, made only between
 # inner solves.
 @inline function _control_time_up!(set::ControlledDeviceSet)
+    if set.solves_started[] >= set.solve_limit[]
+        set.solve_limit_reached[] = true
+        return true
+    end
     isinf(set.deadline[]) && return false
     time() >= set.deadline[] || return false
     set.time_limit_reached[] = true
     return true
 end
+
+# Did the running control solve stop at either limit?
+@inline _control_stopped(set::ControlledDeviceSet) =
+    set.time_limit_reached[] || set.solve_limit_reached[]
 
 """Number of KLU/AA SYMBOLIC factorizations performed inside the last discrete-control
 continuation. With `PolarNRCache` symbolic reuse this stays O(1) per continuation even as
