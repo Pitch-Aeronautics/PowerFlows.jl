@@ -1174,10 +1174,14 @@ function _control_continuation!(
             MAX_CONTROL_PASSES_PER_STAGE=$(MAX_CONTROL_PASSES_PER_STAGE) passes \
             (S=$S); regulation may be loose at time step $ts"
     end
-    ok = snap_and_restore!(pf, data, set, ts, scratch_snap, dVdp, frozen; kwargs...)
-    # Regulating continuous devices (shunts, FACTS) end on their target exactly, or at a limit.
-    ok && _continuous_finish!(pf, data, set, ts, scratch_snap, frozen, dVdp, n_shared,
+    # Regulating continuous devices (shunts, FACTS) end on their target exactly, or at a limit:
+    # before the band settle, whose tests of the banded devices' voltages then read the network
+    # with the continuous devices where they end (T161), and again after it, for what its steps
+    # moved.
+    finish!() = _continuous_finish!(pf, data, set, ts, scratch_snap, frozen, dVdp, n_shared,
         n_taps, ctx; kwargs...)
+    ok = snap_and_restore!(pf, data, set, ts, scratch_snap, dVdp, frozen, finish!; kwargs...)
+    ok && finish!()
     # Classify each FACTS endpoint against its final voltage-dependent bound and setpoint
     # (`saturated` reported by `get_controlled_device_results` and written back to PSY). Uses
     # the final converged voltages from `snap_and_restore!`.
@@ -1926,7 +1930,8 @@ function snap_and_restore!(
     ts::Int,
     scratch_snap::ControlStateSnapshot,
     dVdp::Union{Nothing, Vector{Float64}} = nothing,
-    frozen::Union{Nothing, Vector{Bool}} = nothing;
+    frozen::Union{Nothing, Vector{Bool}} = nothing,
+    before_settle = nothing;
     kwargs...,
 )::Bool
     # Last continuous converged state: the restore path must start from here, not from
@@ -1940,6 +1945,8 @@ function snap_and_restore!(
     cont_facts = _snap_device_group!(set.facts, data, ts, dVdp, n_taps + n_shunts)
     cont_psts = _snap_device_group!(set.phase_shifters, data, ts, dVdp, _gain_pst_offset(set))
     if _ctrl_solve!(pf, data, ts; kwargs...)
+        # `before_settle()`: the continuation's exact finish of its continuous devices (T161).
+        isnothing(before_settle) || before_settle()
         _band_settle!(pf, data, set, ts, scratch_snap, dVdp, frozen; kwargs...)
         return true
     end

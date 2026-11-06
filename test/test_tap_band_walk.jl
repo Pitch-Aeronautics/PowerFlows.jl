@@ -151,3 +151,55 @@ end
     @test taps["U"].current == taps["U2"].current
     @test _tbw_inband(v[2], _TBW_U_BAND)
 end
+
+# T161 (GAP-080): the band settle judged a banded tap's band on the network as the snap left it,
+# with every continuous device still at the continuation's fixed point, off its setpoint by the
+# sigmoid law's residue, and the exact finish that puts them on their setpoints came after it.
+# REF(1) ─ 2 ←T─ 3 (radial, 69 kV side 3): a continuous MODSW 2 shunt at 2 holds 2 at a point
+# setpoint; T regulates its winding-1 bus 3 inside a band whose top lies `m` above where bus 3
+# ends with T at its stored ratio. T's bus is inside its band throughout in PSS/E's terms, but
+# the shunt's residue (bus 2 above its setpoint) lifted bus 3 past the top at the snap: T latched and
+# stepped down, and the step back failed the same test. The shunt's own bus hardly moves with T,
+# so once it is finished first the back-off (or no latch at all) keeps T where it was.
+function _tbw_hv_shunt_system(; hi, vset2 = 1.0, b0 = 0.15)
+    sys = System(100.0)
+    b1 = _tbw_bus!(sys, 1, ACBusTypes.REF, 230)
+    add_component!(sys, Source(; name = "tbw_src", available = true, bus = b1,
+        active_power = 0.0, reactive_power = 0.0, R_th = 1e-5, X_th = 1e-5))
+    b2 = _tbw_bus!(sys, 2, ACBusTypes.PQ, 230)
+    b3 = _tbw_bus!(sys, 3, ACBusTypes.PQ, 69)
+    add_component!(sys, Line(; name = "tbw_l12", available = true, active_power_flow = 0.0,
+        reactive_power_flow = 0.0, arc = Arc(; from = b1, to = b2), r = 0.01, x = 0.1,
+        b = (from = 0.0, to = 0.0), rating = 1.0, angle_limits = (min = -pi / 2, max = pi / 2)))
+    _tbw_load!(sys, b2, 0.5, 0.3)
+    _tbw_load!(sys, b3, 0.1, 0.05)
+    _tbw_tap!(sys, b3, b2; name = "T", tap = 1.0, lims = (0.9, 1.1), ntp = 201,
+        band = (hi - 0.1, hi), reg = 3, r = 0.002, x = 0.08)
+    add_component!(sys, SwitchedAdmittance(; name = "S2", available = true, bus = b2,
+        Y = b0 * im, initial_status = [0], number_of_steps = [1], Y_increase = [3.0im],
+        admittance_limits = (min = vset2, max = vset2),
+        control_mode = PSY.SwitchedAdmittanceControlMode.CONTINUOUS_VOLTAGE,
+        regulated_bus_number = 0,
+        ext = Dict{String, Any}("MODSW" => 2, "ADJM" => 0, "RMPCT" => 100.0)))
+    return sys
+end
+
+@testset "band settle reads the network with continuous devices finished: an in-band tap keeps its position (T161, GAP-080)" begin
+    # Where the network ends with the shunt at 0.3 and T at its stored ratio: no control.
+    ref = PowerFlowData(ACPolarPowerFlow(), _tbw_hv_shunt_system(; hi = 2.0, b0 = 0.3))
+    @test with_logger(() -> solve_power_flow!(ref), NullLogger())
+    bl = PF.get_bus_lookup(ref)
+    v2, v3 = ref.bus_magnitude[bl[2], 1], ref.bus_magnitude[bl[3], 1]
+    for m in (5e-5, 1e-4, 2e-4)
+        hi = round(v3 + m; digits = 7)
+        ok, taps, V, data = _tbw_solve(
+            _tbw_hv_shunt_system(; hi = hi, vset2 = round(v2; digits = 7)))
+        @test ok
+        t = taps["T"]
+        s = only(PF.get_controlled_devices(data).shunts)
+        @test abs(V[bl[2]] - s.vset) < 1e-8                      # the shunt on its setpoint
+        @test t.current == t.initial                              # T held, as PSS/E holds it
+        @test hi - 0.1 < V[bl[3]] <= hi                           # its bus inside the band
+        @test V[bl[3]] ≈ hi - m atol = 2e-6
+    end
+end
