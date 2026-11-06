@@ -414,28 +414,46 @@ continuation starts, its loops stop at their next check, no area is relaxed, and
 checked only between inner solves, so one Newton solve already running finishes first. Without
 discrete control (no enrolled device) it has no effect: the solve is one Newton run, bounded by
 its iteration cap.
+
+`control_solve_limit` (a count; `nothing`, the default, for none) bounds the same solve by the
+number of inner solves it starts, over every continuation it runs (an area relax's included):
+once it has started that many, no further one starts, and the call stops as at the time limit,
+with `get_control_solve_limit_reached(data)` true. Where it stops does not depend on the
+machine's speed, so a caller that needs the same answer on every machine bounds the solve by
+this and keeps the time limit as a backstop. `get_control_solves_started(data)` is the count the
+call started, with or without a limit (0 starts none: the call returns `false` at once).
 """
 function _ac_power_flow_with_area_relax!(
     data::ACPowerFlowData,
     pf::AbstractACPowerFlow{<:ACPowerFlowSolverType},
     time_step::Int64;
     control_time_limit::Union{Nothing, Real} = nothing,
+    control_solve_limit::Union{Nothing, Integer} = nothing,
     kwargs...,
 )
     cd = data.controlled_devices
     isnothing(cd) && return _area_relax_loop!(data, pf, time_step; kwargs...)
     cd.time_limit_reached[] = false
-    isnothing(control_time_limit) &&
+    cd.solve_limit_reached[] = false
+    cd.solves_started[] = 0
+    isnothing(control_time_limit) && isnothing(control_solve_limit) &&
         return _area_relax_loop!(data, pf, time_step; kwargs...)
-    cd.deadline[] = time() + Float64(control_time_limit)
+    isnothing(control_time_limit) || (cd.deadline[] = time() + Float64(control_time_limit))
+    isnothing(control_solve_limit) || (cd.solve_limit[] = max(Int(control_solve_limit), 0))
     converged = try
         _area_relax_loop!(data, pf, time_step; kwargs...)
     finally
         cd.deadline[] = Inf
+        cd.solve_limit[] = typemax(Int)
     end
-    cd.time_limit_reached[] || return converged
-    @warn "discrete control: the time limit of $(control_time_limit) s passed before the \
-        control solve finished; not converged (time step $time_step)"
+    _control_stopped(cd) || return converged
+    if cd.solve_limit_reached[]
+        @warn "discrete control: the inner-solve limit of $(control_solve_limit) was used up \
+            before the control solve finished; not converged (time step $time_step)"
+    else
+        @warn "discrete control: the time limit of $(control_time_limit) s passed before the \
+            control solve finished; not converged (time step $time_step)"
+    end
     data.converged[time_step] = false
     return false
 end
@@ -455,7 +473,8 @@ function _area_relax_loop!(
     while true
         converged = _ac_power_flow(data, pf, time_step; kwargs...)
         converged && break
-        get_control_time_limit_reached(data) && return false
+        (get_control_time_limit_reached(data) || get_control_solve_limit_reached(data)) &&
+            return false
         iszero(n_controlled_areas(data)) && break
         gaps = _area_residual_gaps(data, time_step)
         gap, worst_ix = findmax(abs, gaps)

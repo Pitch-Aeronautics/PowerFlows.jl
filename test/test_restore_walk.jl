@@ -1,4 +1,5 @@
-# The restore walk after a failed post-snap solve, and the control solve's time limit (T156).
+# The restore walk after a failed post-snap solve, and the control solve's time limit (T156) and
+# inner-solve limit (T160).
 
 # IEEE 14 (PSB `c_sys14`) with eight discrete switched shunts and one FACTS, solved under discrete
 # control; then every withdrawal times `overload`, which no device setting can carry, and shunt
@@ -166,4 +167,67 @@ end
     # the next call without a limit clears the reason and solves as before
     @test solve_power_flow!(data)
     @test !PowerFlows.get_control_time_limit_reached(data)
+end
+
+@testset "control solve limit: a count, so it stops at the same inner solve every time (T160)" begin
+    # the T156 fixture: four discrete shunts and a FACTS, the full continuation
+    sys = _make_ieee14_scaled_load_system(1.0)
+    for b in (9, 10, 13, 14)
+        _add_switched_shunt!(sys, b; voltage_setpoint = 1.04)
+    end
+    _add_facts_shunt!(sys, 12; voltage_setpoint = 1.05)
+    pf = ACPolarPowerFlow{NewtonRaphsonACPowerFlow}(; control_discrete_devices = true)
+    ref = PowerFlowData(pf, sys)
+    @test solve_power_flow!(ref)
+    n_ref = PowerFlows.get_control_inner_solve_count(ref)
+    @test n_ref > 5
+    @test PowerFlows.get_control_solves_started(ref) == n_ref       # counted with no limit armed
+    @test !PowerFlows.get_control_solve_limit_reached(ref)
+
+    # a limit the solve does not reach changes nothing, and is disarmed after the call
+    data = PowerFlowData(pf, sys)
+    @test PowerFlows._ac_power_flow_with_area_relax!(data, pf, 1; control_solve_limit = n_ref)
+    @test !PowerFlows.get_control_solve_limit_reached(data)
+    @test PowerFlows.get_control_solves_started(data) == n_ref
+    @test data.bus_magnitude[:, 1] == ref.bus_magnitude[:, 1]
+    @test _all_parameters(PowerFlows.get_controlled_devices(data)) ==
+          _all_parameters(PowerFlows.get_controlled_devices(ref))
+    @test PowerFlows.get_controlled_devices(data).solve_limit[] == typemax(Int)
+
+    # 0 starts none
+    data = PowerFlowData(pf, sys)
+    conv = @test_logs (:warn, r"inner-solve limit of 0 was used up") match_mode = :any begin
+        PowerFlows._ac_power_flow_with_area_relax!(data, pf, 1; control_solve_limit = 0)
+    end
+    @test !conv && !data.converged[1]
+    @test PowerFlows.get_control_solve_limit_reached(data)
+    @test !PowerFlows.get_control_time_limit_reached(data)
+    @test PowerFlows.get_control_solves_started(data) == 0
+
+    # a limit inside the continuation stops there, at the same count and the same state each time
+    k = n_ref ÷ 2
+    runs = map(1:2) do _
+        d = PowerFlowData(pf, sys)
+        c = Logging.with_logger(Logging.NullLogger()) do
+            PowerFlows._ac_power_flow_with_area_relax!(d, pf, 1; control_solve_limit = k)
+        end
+        (c, PowerFlows.get_control_solves_started(d), PowerFlows.get_control_solve_limit_reached(d),
+            copy(d.bus_magnitude[:, 1]), _all_parameters(PowerFlows.get_controlled_devices(d)))
+    end
+    for r in runs
+        @test !r[1] && r[2] == k && r[3]
+    end
+    @test runs[1][4] == runs[2][4] && runs[1][5] == runs[2][5]
+
+    # with a generous time limit beside it, the count decides; the next unlimited call solves as before
+    data = PowerFlowData(pf, sys)
+    conv = Logging.with_logger(Logging.NullLogger()) do
+        PowerFlows._ac_power_flow_with_area_relax!(data, pf, 1; control_solve_limit = k,
+            control_time_limit = 3600.0)
+    end
+    @test !conv && PowerFlows.get_control_solve_limit_reached(data) &&
+          !PowerFlows.get_control_time_limit_reached(data)
+    @test isinf(PowerFlows.get_controlled_devices(data).deadline[])
+    @test solve_power_flow!(data)
+    @test !PowerFlows.get_control_solve_limit_reached(data)
 end
