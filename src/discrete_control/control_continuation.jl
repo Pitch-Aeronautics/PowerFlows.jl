@@ -1177,7 +1177,7 @@ function _control_continuation!(
     ok = snap_and_restore!(pf, data, set, ts, scratch_snap, dVdp, frozen; kwargs...)
     # Regulating continuous devices (shunts, FACTS) end on their target exactly, or at a limit.
     ok && _continuous_finish!(pf, data, set, ts, scratch_snap, frozen, dVdp, n_shared,
-        n_taps; kwargs...)
+        n_taps, ctx; kwargs...)
     # Classify each FACTS endpoint against its final voltage-dependent bound and setpoint
     # (`saturated` reported by `get_controlled_device_results` and written back to PSY). Uses
     # the final converged voltages from `snap_and_restore!`.
@@ -1200,8 +1200,10 @@ end
 # one PSS/E pins there; FACTS that PSS/E holds at |Q| = SHMX·V ended at 0.94 of their bound,
 # neither at setpoint nor classified saturated. So after the snap every regulating continuous
 # device (a continuous switched shunt with a zero-width band or latched on an edge, and every
-# FACTS) takes undamped Newton steps on its own susceptance, b ← clamp(b − (y − y*)/(dy/db)),
-# all devices together with one joint solve per round and a secant refresh of dy/db, until
+# FACTS) takes undamped Newton steps on its susceptance, all devices together with one joint
+# solve per round: the joint step on the devices' sensitivities at the round's state
+# (`_finish_joint_step!`, T161), or without a sensitivity context b ← clamp(b − (y − y*)/(dy/db))
+# on each device's own secant-refreshed dy/db, until
 # |y − y*| ≤ CONTROL_FINISH_VTOL, the step clamps at a limit (the device then sits exactly
 # there; a FACTS's |V|-dependent bound is refreshed every round), or the step's own mismatch
 # |Δb|·V² is below the finish's solve tolerance. Those solves converge to
@@ -1287,9 +1289,124 @@ function _finish_undo_group!(devices, offset::Int, data, ts::Int, prev, moved)
     return
 end
 
+# The finish's joint Newton step (T161). Each device's own secant gain is measured from a voltage
+# its neighbours moved in the same round, so coupled devices stepped together on those gains
+# swing between under- and overshoot; instead the round solves the devices' joint linearisation
+# at its converged state: with M[i, j] = dy_i/db_j from the sensitivity context (one triangular
+# solve per device), the steps Δb solve y + M·Δb = y*. Devices regulating one bus have equal rows
+# and share the correction equally in voltage (`u_h`, each member b_j += u_h/(m·M[j, j])), with
+# the members' mean target. A device whose step leaves its range (or passes its anchor, see
+# `_band_clamp`) is held at that bound and the rest solved again, at most once per device; one
+# already there, with nowhere to go, is pinned for the rest of the finish, as in the secant step.
+# A step inside the range below what the solve resolves (|Δb|·V² ≤ `ftol`) is not taken this
+# round. A device whose own effect is below the gain floor (its bus held by a generator) is left
+# out of the round. Returns whether any device moved, or `nothing` when the reduced system is
+# singular (the caller takes the secant step instead).
+function _finish_joint_step!(data, set::ControlledDeviceSet, ts::Int, n_taps::Int,
+    active::Vector{Bool}, prev::Vector{Float64}, moved::Vector{Bool}, ftol::Float64,
+    ctx::_SensitivityContext)
+    off_facts = n_taps + length(set.shunts)
+    idxs = Int[]
+    devs = AbstractShuntControl[]
+    for (j, d) in enumerate(set.shunts)
+        active[n_taps + j] && (push!(idxs, n_taps + j); push!(devs, d))
+    end
+    for (j, d) in enumerate(set.facts)
+        active[off_facts + j] && (push!(idxs, off_facts + j); push!(devs, d))
+    end
+    k = length(devs)
+    k == 0 && return false
+    e = Vector{Float64}(undef, k)
+    lo = Vector{Float64}(undef, k)
+    hi = Vector{Float64}(undef, k)
+    cbus = Vector{Int}(undef, k)
+    for (i, d) in enumerate(devs)
+        lo[i], hi[i] = _finish_limits!(d, data, ts)
+        e[i] = measured_value(d, data, ts) - _continuous_target(d)
+        cbus[i] = controlled_bus_ix(d)
+    end
+    # M[i, j] = dy_i/db_j: y_i is |V| at a PQ bus, x[2b−1] (see `_linear_plant_sign`).
+    M = zeros(k, k)
+    for (j, d) in enumerate(devs)
+        _dF_dp!(ctx.rhs, d, data, ts)
+        copyto!(ctx.sol, ctx.rhs)
+        solve!(ctx.lin_cache, ctx.sol)
+        for i in 1:k
+            data.bus_type[cbus[i], ts] == PSY.ACBusTypes.PQ &&
+                (M[i, j] = -ctx.sol[2 * cbus[i] - 1])
+        end
+    end
+    # In the round: a device with an effect of its own. Held: the step a device is fixed at.
+    free = [abs(M[i, i]) * (hi[i] - lo[i]) >= CONTROL_GAIN_FLOOR for i in 1:k]
+    # Every device in the round on its target and inside its (refreshed) range: finished.
+    all(i -> !free[i] || (abs(e[i]) <= CONTROL_FINISH_VTOL && lo[i] <= devs[i].current <= hi[i]),
+        1:k) && return false
+    held = fill(NaN, k)
+    Δb = zeros(k)
+    target = [d.current for d in devs]
+    for _ in 0:k
+        fr = findall(free)
+        isempty(fr) && break
+        # One unknown per regulated bus among the free devices.
+        buses = unique(cbus[fr])
+        nb = length(buses)
+        col = Dict(b => h for (h, b) in enumerate(buses))
+        members = [fr[cbus[fr] .== b] for b in buses]
+        A = zeros(nb, nb)
+        r = zeros(nb)
+        for (g, b) in enumerate(buses)
+            ig = members[g][1]                  # equal rows: any member's
+            r[g] = -sum(e[members[g]]) / length(members[g])
+            for j in 1:k
+                isnan(held[j]) || (r[g] -= M[ig, j] * held[j])
+            end
+            for j in fr
+                A[g, col[cbus[j]]] += M[ig, j] / (length(members[col[cbus[j]]]) * M[j, j])
+            end
+        end
+        F = LinearAlgebra.lu(A; check = false)
+        LinearAlgebra.issuccess(F) || return nothing
+        u = F \ r
+        clamped = false
+        for j in fr
+            d = devs[j]
+            h = col[cbus[j]]
+            p = d.current + u[h] / (length(members[h]) * M[j, j])
+            q = _band_clamp(d, clamp(p, lo[j], hi[j]), M[j, j])
+            target[j] = q
+            Δb[j] = q - d.current
+            if q != p
+                held[j] = Δb[j]
+                free[j] = false
+                clamped = true
+            end
+        end
+        clamped || break
+    end
+    any_moved = false
+    for (j, d) in enumerate(devs)
+        idx = idxs[j]
+        isnan(held[j]) && !free[j] && continue          # no effect of its own: not this round
+        if !isnan(held[j]) && abs(Δb[j]) <= 1e-12 * (hi[j] - lo[j])
+            active[idx] = false     # pinned at a limit (or its anchor): it stays there
+            continue
+        end
+        p = target[j]
+        # a step inside the range below what the solve resolves: not taken (a step onto a limit
+        # is, so a railed device ends exactly on it)
+        lo[j] < p < hi[j] && abs(Δb[j]) * data.bus_magnitude[d.bus_ix, ts]^2 <= ftol && continue
+        prev[idx] = d.current
+        apply_parameter!(d, data, p, ts)
+        moved[idx] = true
+        any_moved = true
+    end
+    return any_moved
+end
+
 function _continuous_finish!(
     pf, data, set::ControlledDeviceSet, ts::Int, snap::ControlStateSnapshot,
-    frozen::Vector{Bool}, dVdp::Vector{Float64}, n_shared::Vector{Int}, n_taps::Int;
+    frozen::Vector{Bool}, dVdp::Vector{Float64}, n_shared::Vector{Int}, n_taps::Int,
+    ctx::Union{Nothing, _SensitivityContext} = nothing;
     kwargs...,
 )
     n_shunts = length(set.shunts)
@@ -1314,10 +1431,21 @@ function _continuous_finish!(
     for _ in 1:CONTROL_FINISH_MAX_ROUNDS
         fill!(moved, false)
         _capture_state!(snap, data, ts)
-        any_moved = _finish_step_group!(set.shunts, n_taps, data, ts, active, dVdp, n_shared,
-            prev, yprev, moved, ftol)
-        any_moved |= _finish_step_group!(set.facts, off_facts, data, ts, active, dVdp,
-            n_shared, prev, yprev, moved, ftol)
+        # The joint step on the sensitivity context at this round's state; the per-device secant
+        # step without one (a non-polar formulation, or a singular Jacobian here).
+        joint = !isnothing(ctx) && _refresh_sensitivity_context!(ctx, data, ts; kwargs...)
+        any_moved = false
+        if joint
+            any_moved = _finish_joint_step!(data, set, ts, n_taps, active, prev, moved, ftol,
+                ctx)
+        end
+        if isnothing(any_moved) || !joint
+            any_moved = _finish_step_group!(set.shunts, n_taps, data, ts, active, dVdp,
+                n_shared, prev, yprev, moved, ftol)
+            any_moved |= _finish_step_group!(set.facts, off_facts, data, ts, active, dVdp,
+                n_shared, prev, yprev, moved, ftol)
+            joint = false
+        end
         any_moved || return true
         if !_ctrl_solve!(pf, data, ts; kwargs..., tol = ftol)
             _finish_undo_group!(set.shunts, n_taps, data, ts, prev, moved)
@@ -1327,8 +1455,10 @@ function _continuous_finish!(
                 converge; leaving it at its last converged setting (time step $ts)."
             return false
         end
-        _finish_secant_group!(set.shunts, n_taps, data, ts, dVdp, prev, yprev, moved)
-        _finish_secant_group!(set.facts, off_facts, data, ts, dVdp, prev, yprev, moved)
+        if !joint
+            _finish_secant_group!(set.shunts, n_taps, data, ts, dVdp, prev, yprev, moved)
+            _finish_secant_group!(set.facts, off_facts, data, ts, dVdp, prev, yprev, moved)
+        end
     end
     return true
 end

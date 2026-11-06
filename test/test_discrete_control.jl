@@ -2150,6 +2150,58 @@ end
     @test PowerFlows.CONTROL_FINISH_SOLVE_TOL <= 1e-8
 end
 
+# T161: coupled continuous devices. REF(1) ─ 2 ─ 3 ─ 4, each of 2..4 with a load and a continuous
+# MODSW 2 shunt holding its own bus at a point setpoint, the buses close enough that a step of one
+# moves its neighbours' voltages by a large part of what it moves its own. The finish used to step
+# every device at once on its own secant gain, which a neighbour's move in the same round
+# corrupts: the gains swung by orders of magnitude and the round cap ended the finish wherever its
+# last step left it (here 1.3e-4 p.u. off a setpoint). The joint step on the sensitivity
+# context lands every device.
+function _coupled_shunts_system(; vsets = nothing, xl = 0.05)
+    sys = System(100.0)
+    b1 = _add_simple_bus!(sys, 1, ACBusTypes.REF, 230, 1.0, 0.0)
+    _add_simple_source!(sys, b1, 0.0, 0.0)
+    prev, buses = b1, ACBus[]
+    for k in 2:4
+        b = _add_simple_bus!(sys, k, ACBusTypes.PQ, 230, 1.0, 0.0)
+        x = k == 2 ? 0.1 : xl
+        _add_simple_line!(sys, prev, b, x / 10, x, 0.0)
+        _add_simple_load!(sys, b, 30.0, 20.0)
+        push!(buses, b)
+        prev = b
+    end
+    for (i, b) in enumerate(buses)
+        vs = isnothing(vsets) ? 1.0 : vsets[i]
+        add_component!(sys, SwitchedAdmittance(; name = "S$(get_number(b))", available = true,
+            bus = b, Y = 0.3im, initial_status = [0], number_of_steps = [1],
+            Y_increase = [3.0im], admittance_limits = (min = vs, max = vs),
+            control_mode = PSY.SwitchedAdmittanceControlMode.CONTINUOUS_VOLTAGE,
+            regulated_bus_number = 0,
+            ext = Dict{String, Any}("MODSW" => 2, "ADJM" => 0, "RMPCT" => 100.0)))
+    end
+    return sys
+end
+
+@testset "exact finish: coupled continuous shunts on neighbouring buses all reach their setpoints (T161)" begin
+    data0 = PowerFlowData(ACPolarPowerFlow(), _coupled_shunts_system())
+    @test solve_power_flow!(data0)
+    bl = PF.get_bus_lookup(data0)
+    v0 = [data0.bus_magnitude[bl[k], 1] for k in 2:4]
+    vsets = round.(v0 .+ [0.004, 0.0, -0.004]; digits = 6)
+    data = PowerFlowData(
+        ACPolarPowerFlow(; control_discrete_devices = true, remote_voltage_control = false),
+        _coupled_shunts_system(; vsets = vsets))
+    tl = Test.TestLogger(; min_level = Logging.Warn)
+    @test Logging.with_logger(() -> solve_power_flow!(data), tl)
+    @test isempty(tl.logs)                                 # no freeze, no loose regulation
+    sh = PF.get_controlled_devices(data).shunts
+    @test length(sh) == 3
+    for d in sh
+        @test d.b_min < d.current < d.b_max                # free: each can reach its setpoint
+        @test abs(data.bus_magnitude[d.bus_ix, 1] - d.vset) < 1e-8
+    end
+end
+
 # ── Band settle beside a railed shunt (GAP-030) ─────────────────────────────────────────────
 # REF(1) ─ X(2) ─ Y(3), loads at X and Y. Discrete (MODSW 1) shunts: capacitor A at X, one
 # 0.1 p.u. block, and B at Y, a reactor whose blocks `b_blocks` (one −0.5 p.u. block: levels
