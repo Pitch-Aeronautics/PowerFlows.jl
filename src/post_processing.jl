@@ -34,7 +34,20 @@ function _calculate_fixed_admittance_powers(
     return busIxToFAPower
 end
 
-# sometimes errors on @assert length(remaining_unit_index) == 1. See issue #231
+"""
+The unit that takes a bus's residual when every unit there is at its limit (#231): the
+one with the widest range of `get_limits` among the units with any range at all, or, when
+no unit has one, the largest by base power.
+"""
+function _unit_for_residual(devices, get_limits)
+    span(d) = (l = get_limits(d); l.max - l.min)
+    widest = argmax(span, devices)
+    span(widest) > BOUNDS_TOLERANCE && return widest
+    return argmax(PSY.get_base_power, devices)
+end
+
+# Errored on @assert length(remaining_unit_index) == 1 when every unit ended at its limit
+# (issue #231); the residual now goes to `_unit_for_residual`.
 function _power_redistribution_ref(
     sys::PSY.System,
     P_gen::Float64,
@@ -163,15 +176,27 @@ function _power_redistribution_ref(
         end
         if !isapprox(p_residual, 0.0; atol = ISAPPROX_ZERO_TOLERANCE)
             remaining_unit_index = setdiff(1:length(devices), units_at_limit)
-            @assert length(remaining_unit_index) == 1 remaining_unit_index
-            device = devices[remaining_unit_index[1]]
-            @debug "Remaining residual $q_residual, $(PSY.get_name(bus))"
-            p_set_point = PSY.get_active_power(device) + p_residual
-            PSY.set_active_power!(device, p_set_point)
-            p_limits = get_active_power_limits_for_power_flow(device)
-            if (p_set_point >= p_limits.max - BOUNDS_TOLERANCE) ||
-               (p_set_point <= p_limits.min + BOUNDS_TOLERANCE)
-                @error "Unit $(PSY.get_name(device)) P=$(p_set_point) above limits. P_max = $(p_limits.max) P_min = $(p_limits.min)"
+            if isempty(remaining_unit_index)
+                # Every unit is at its limit: the bus's solved P is beyond them all (#231).
+                device = _unit_for_residual(devices, get_active_power_limits_for_power_flow)
+                p_set_point = PSY.get_active_power(device) + p_residual
+                PSY.set_active_power!(device, p_set_point)
+                p_limits = get_active_power_limits_for_power_flow(device)
+                @warn "Every unit at bus $(PSY.get_name(bus)) is at its active power " *
+                      "limit: the residual $(p_residual) went to unit " *
+                      "$(PSY.get_name(device)), which it puts past its limit. " *
+                      "P=$(p_set_point) P_max = $(p_limits.max) P_min = $(p_limits.min)"
+            else
+                @assert length(remaining_unit_index) == 1 remaining_unit_index
+                device = devices[remaining_unit_index[1]]
+                @debug "Remaining residual $p_residual, $(PSY.get_name(bus))"
+                p_set_point = PSY.get_active_power(device) + p_residual
+                PSY.set_active_power!(device, p_set_point)
+                p_limits = get_active_power_limits_for_power_flow(device)
+                if (p_set_point >= p_limits.max - BOUNDS_TOLERANCE) ||
+                   (p_set_point <= p_limits.min + BOUNDS_TOLERANCE)
+                    @error "Unit $(PSY.get_name(device)) P=$(p_set_point) above limits. P_max = $(p_limits.max) P_min = $(p_limits.min)"
+                end
             end
         end
     end
@@ -179,7 +204,8 @@ function _power_redistribution_ref(
     return
 end
 
-# sometimes errors on @assert length(remaining_unit_index) == 1. See issue #231
+# Errored on @assert length(remaining_unit_index) == 1 when every unit ended at its limit
+# (issue #231); the residual now goes to `_unit_for_residual`.
 function _reactive_power_redistribution_pv(
     sys::PSY.System,
     Q_gen::Float64,
@@ -329,15 +355,28 @@ function _reactive_power_redistribution_pv(
     # Last attempt to allocate reactive power
     if !isapprox(q_residual, 0.0; atol = ISAPPROX_ZERO_TOLERANCE)
         remaining_unit_index = setdiff(1:length(devices), units_at_limit)
-        @assert length(remaining_unit_index) == 1 remaining_unit_index
-        device = devices[remaining_unit_index[1]]
-        @debug "Remaining residual $q_residual, $(PSY.get_name(bus))"
-        q_set_point = PSY.get_reactive_power(device) + q_residual
-        PSY.set_reactive_power!(device, q_set_point)
-        q_limits = get_reactive_power_limits_for_power_flow(device)
-        if (q_set_point >= q_limits.max - BOUNDS_TOLERANCE) ||
-           (q_set_point <= q_limits.min + BOUNDS_TOLERANCE)
-            @error "Unit $(PSY.get_name(device)) Q=$(q_set_point) above limits. Q_max = $(q_limits.max) Q_min = $(q_limits.min)"
+        if isempty(remaining_unit_index)
+            # Every unit is at its limit, those with no Q capability among them: the bus's
+            # solved Q is beyond them all, as when a control holds it PV past them (#231).
+            device = _unit_for_residual(devices, get_reactive_power_limits_for_power_flow)
+            q_set_point = PSY.get_reactive_power(device) + q_residual
+            PSY.set_reactive_power!(device, q_set_point)
+            q_limits = get_reactive_power_limits_for_power_flow(device)
+            @warn "Every unit at bus $(PSY.get_name(bus)) is at its reactive power " *
+                  "limit: the residual $(q_residual) went to unit " *
+                  "$(PSY.get_name(device)), which it puts past its limit. " *
+                  "Q=$(q_set_point) Q_max = $(q_limits.max) Q_min = $(q_limits.min)"
+        else
+            @assert length(remaining_unit_index) == 1 remaining_unit_index
+            device = devices[remaining_unit_index[1]]
+            @debug "Remaining residual $q_residual, $(PSY.get_name(bus))"
+            q_set_point = PSY.get_reactive_power(device) + q_residual
+            PSY.set_reactive_power!(device, q_set_point)
+            q_limits = get_reactive_power_limits_for_power_flow(device)
+            if (q_set_point >= q_limits.max - BOUNDS_TOLERANCE) ||
+               (q_set_point <= q_limits.min + BOUNDS_TOLERANCE)
+                @error "Unit $(PSY.get_name(device)) Q=$(q_set_point) above limits. Q_max = $(q_limits.max) Q_min = $(q_limits.min)"
+            end
         end
     end
 
