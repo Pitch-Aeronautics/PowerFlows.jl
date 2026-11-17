@@ -34,6 +34,18 @@ function _calculate_fixed_admittance_powers(
     return busIxToFAPower
 end
 
+"""Bus numbers with a device the redistribution can write to: those
+`_is_available_source` finds at some bus."""
+function _buses_with_available_source(sys::PSY.System)
+    buses = Set{Int}()
+    for x in PSY.get_components(PSY.StaticInjection, sys)
+        PSY.get_available(x) || continue
+        (x isa PSY.ElectricLoad || x isa PSY.FACTSControlDevice) && continue
+        push!(buses, PSY.get_number(x.bus))
+    end
+    return buses
+end
+
 """
 The unit that takes a bus's residual when every unit there is at its limit (#231): the
 one with the widest range of `get_limits` among the units with any range at all, or, when
@@ -243,7 +255,9 @@ function _reactive_power_redistribution_pv(
     elseif length(devices_) > 1
         devices = sort(collect(devices_); by = x -> PSY.get_max_reactive_power(x))
     else
-        error("No devices in bus $(PSY.get_name(bus))")
+        @warn "No available source at bus $(PSY.get_name(bus)): its reactive power " *
+              "is not redistributed." maxlog = PF_MAX_LOG
+        return
     end
     total_active_power = 0.0
     for d in devices
@@ -845,6 +859,8 @@ function write_power_flow_solution!(
     # once redistribution is working again, could remove skip_redistribution.
     bus_lookup = get_bus_lookup(data)
     possible_PV = can_be_PV(sys)
+    source_buses = _buses_with_available_source(sys)
+    pv_without_source = 0
     for (bus_number, reduced_buses) in PNM.get_bus_reduction_map(nrd)
         if length(reduced_buses) == 0
             # no reduction.
@@ -878,8 +894,13 @@ function write_power_flow_solution!(
                 # then not only reactive power but also active power could have been changed
                 # in the power flow calculation. This requires the same
                 # active and reactive power redistribution step as for the REF bus.
-                if data.bus_slack_participation_factors[ix, time_step] != 0.0 &&
-                   !pf.skip_redistribution
+                if !pf.skip_redistribution && !(bus_number in source_buses)
+                    # Reported PV with no device to write Q onto: a remote-regulation member,
+                    # or a bus held PV by a switched shunt (`must_be_PV`) whose machines are
+                    # all out of service. Its Q has no unit to go to.
+                    pv_without_source += 1
+                elseif data.bus_slack_participation_factors[ix, time_step] != 0.0 &&
+                       !pf.skip_redistribution
                     P_gen = data.bus_active_power_injections[ix, time_step]
                     _power_redistribution_ref(
                         sys,
@@ -916,6 +937,9 @@ function write_power_flow_solution!(
                   " buses" maxlog = PF_MAX_LOG
         end
     end
+    pv_without_source > 0 &&
+        @warn "Skipped reactive power redistribution at $(pv_without_source) bus(es) " *
+              "reported PV with no available source to write it onto."
 
     nrd = PNM.get_network_reduction_data(get_power_network_matrix(data))
     arc_lookup = get_arc_lookup(data)
