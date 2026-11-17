@@ -46,20 +46,39 @@ function _buses_with_available_source(sys::PSY.System)
     return buses
 end
 
+"""How far a unit at `value` within `limits` can move in the direction of `residual`."""
+_headroom(limits, value, residual) =
+    max(residual > 0 ? limits.max - value : value - limits.min, 0.0)
+
 """
-The unit that takes a bus's residual when every unit there is at its limit (#231): the
-one with the widest range of `get_limits` among the units with any range at all, or, when
-no unit has one, the largest by base power.
+The unit among `devices` that takes a bus's residual the redistribution could not share
+out (#231): the one with the most headroom in the residual's direction (`get_limits` and
+`get_value`: Qmax − Q for a positive residual, Q − Qmin for a negative one). When no unit
+has any, the widest range of `get_limits`, and when no unit has a range, the largest by
+base power. A tie goes to the first in the order of `devices`.
 """
-function _unit_for_residual(devices, get_limits)
+function _unit_for_residual(devices, get_limits, get_value, residual)
+    headroom(d) = _headroom(get_limits(d), get_value(d), residual)
+    best = argmax(headroom, devices)
+    headroom(best) > BOUNDS_TOLERANCE && return best
     span(d) = (l = get_limits(d); l.max - l.min)
     widest = argmax(span, devices)
     span(widest) > BOUNDS_TOLERANCE && return widest
     return argmax(PSY.get_base_power, devices)
 end
 
-# Errored on @assert length(remaining_unit_index) == 1 when every unit ended at its limit
-# (issue #231); the residual now goes to `_unit_for_residual`.
+"""The end of a warning on a residual given to one unit: whether it put the unit past its
+limits."""
+_residual_outcome(value, limits) =
+    if limits.min - BOUNDS_TOLERANCE <= value <= limits.max + BOUNDS_TOLERANCE
+        "which keeps it within its limits"
+    else
+        "which it puts past its limit"
+    end
+
+# Errored on @assert length(remaining_unit_index) == 1 when every unit ended at its limit,
+# or when more than one unit was left (issue #231); the residual now goes to
+# `_unit_for_residual`.
 function _power_redistribution_ref(
     sys::PSY.System,
     P_gen::Float64,
@@ -161,6 +180,8 @@ function _power_redistribution_ref(
                 @warn "all devices at the active Power Limit"
                 break
             end
+            # No unit left to share it: the last attempt below takes it.
+            length(units_at_limit) == length(devices) && break
             for (ix, d) in enumerate(devices)
                 ix ∈ units_at_limit && continue
                 p_limits = get_active_power_limits_for_power_flow(d)
@@ -190,17 +211,22 @@ function _power_redistribution_ref(
             remaining_unit_index = setdiff(1:length(devices), units_at_limit)
             if isempty(remaining_unit_index)
                 # Every unit is at its limit: the bus's solved P is beyond them all (#231).
-                device = _unit_for_residual(devices, get_active_power_limits_for_power_flow)
+                device =
+                    _unit_for_residual(devices, get_active_power_limits_for_power_flow,
+                        PSY.get_active_power, p_residual)
                 p_set_point = PSY.get_active_power(device) + p_residual
                 PSY.set_active_power!(device, p_set_point)
                 p_limits = get_active_power_limits_for_power_flow(device)
                 @warn "Every unit at bus $(PSY.get_name(bus)) is at its active power " *
                       "limit: the residual $(p_residual) went to unit " *
-                      "$(PSY.get_name(device)), which it puts past its limit. " *
+                      "$(PSY.get_name(device)), " *
+                      "$(_residual_outcome(p_set_point, p_limits)). " *
                       "P=$(p_set_point) P_max = $(p_limits.max) P_min = $(p_limits.min)"
             else
-                @assert length(remaining_unit_index) == 1 remaining_unit_index
-                device = devices[remaining_unit_index[1]]
+                # One unit left takes it; of several, the one `_unit_for_residual` picks.
+                device = _unit_for_residual(devices[remaining_unit_index],
+                    get_active_power_limits_for_power_flow, PSY.get_active_power,
+                    p_residual)
                 @debug "Remaining residual $p_residual, $(PSY.get_name(bus))"
                 p_set_point = PSY.get_active_power(device) + p_residual
                 PSY.set_active_power!(device, p_set_point)
@@ -321,13 +347,34 @@ function _reactive_power_redistribution_pv(
                 @debug "Only one device not at the limit in Bus"
                 break
             end
+            # No unit left to share it: the last attempt below takes it.
+            length(units_at_limit) == length(devices) && break
             removed_power = sum(PSY.get_active_power.(devices[units_at_limit]))
+            remaining = setdiff(1:length(devices), units_at_limit)
+            # Every unit left makes no P (one online at 0 MW, condensing): they share by
+            # their headroom in the residual's direction. `fraction = 1` each handed the
+            # residual out once per unit, and it swung until the iterations ran out (#231).
+            zero_p_left = all(iszero(PSY.get_active_power(devices[ix])) for ix in remaining)
+            q_headroom(d) = _headroom(
+                get_reactive_power_limits_for_power_flow(d),
+                PSY.get_reactive_power(d),
+                q_residual,
+            )
+            headroom_left =
+                zero_p_left ? sum(q_headroom(devices[ix]) for ix in remaining) : 0.0
+            if zero_p_left && headroom_left <= BOUNDS_TOLERANCE
+                # None of them can move in the residual's direction: each is at a limit.
+                append!(units_at_limit, remaining)
+                break
+            end
             reallocated_q = 0.0
             for (ix, d) in enumerate(devices)
                 ix ∈ units_at_limit && continue
                 q_limits = get_reactive_power_limits_for_power_flow(d)
 
-                if removed_power < total_active_power
+                if zero_p_left
+                    fraction = q_headroom(d) / headroom_left
+                elseif removed_power < total_active_power
                     fraction =
                         PSY.get_active_power(d) / (total_active_power - removed_power)
                 elseif isapprox(removed_power, total_active_power)
@@ -372,17 +419,21 @@ function _reactive_power_redistribution_pv(
         if isempty(remaining_unit_index)
             # Every unit is at its limit, those with no Q capability among them: the bus's
             # solved Q is beyond them all, as when a control holds it PV past them (#231).
-            device = _unit_for_residual(devices, get_reactive_power_limits_for_power_flow)
+            device = _unit_for_residual(devices, get_reactive_power_limits_for_power_flow,
+                PSY.get_reactive_power, q_residual)
             q_set_point = PSY.get_reactive_power(device) + q_residual
             PSY.set_reactive_power!(device, q_set_point)
             q_limits = get_reactive_power_limits_for_power_flow(device)
             @warn "Every unit at bus $(PSY.get_name(bus)) is at its reactive power " *
                   "limit: the residual $(q_residual) went to unit " *
-                  "$(PSY.get_name(device)), which it puts past its limit. " *
+                  "$(PSY.get_name(device)), " *
+                  "$(_residual_outcome(q_set_point, q_limits)). " *
                   "Q=$(q_set_point) Q_max = $(q_limits.max) Q_min = $(q_limits.min)"
         else
-            @assert length(remaining_unit_index) == 1 remaining_unit_index
-            device = devices[remaining_unit_index[1]]
+            # One unit left takes it; of several, the one `_unit_for_residual` picks.
+            device = _unit_for_residual(devices[remaining_unit_index],
+                get_reactive_power_limits_for_power_flow, PSY.get_reactive_power,
+                q_residual)
             @debug "Remaining residual $q_residual, $(PSY.get_name(bus))"
             q_set_point = PSY.get_reactive_power(device) + q_residual
             PSY.set_reactive_power!(device, q_set_point)
@@ -861,6 +912,7 @@ function write_power_flow_solution!(
     possible_PV = can_be_PV(sys)
     source_buses = _buses_with_available_source(sys)
     pv_without_source = 0
+    pv_without_source_q = 0.0  # Σ|Q|, system per unit
     for (bus_number, reduced_buses) in PNM.get_bus_reduction_map(nrd)
         if length(reduced_buses) == 0
             # no reduction.
@@ -899,6 +951,7 @@ function write_power_flow_solution!(
                     # or a bus held PV by a switched shunt (`must_be_PV`) whose machines are
                     # all out of service. Its Q has no unit to go to.
                     pv_without_source += 1
+                    pv_without_source_q += abs(Q_gen)
                 elseif data.bus_slack_participation_factors[ix, time_step] != 0.0 &&
                        !pf.skip_redistribution
                     P_gen = data.bus_active_power_injections[ix, time_step]
@@ -939,7 +992,9 @@ function write_power_flow_solution!(
     end
     pv_without_source > 0 &&
         @warn "Skipped reactive power redistribution at $(pv_without_source) bus(es) " *
-              "reported PV with no available source to write it onto."
+              "reported PV with no available source to write it onto: their solved Q, " *
+              "$(round(pv_without_source_q * PSY.get_base_power(sys); digits = 3)) Mvar " *
+              "in magnitude, is written to no unit."
 
     nrd = PNM.get_network_reduction_data(get_power_network_matrix(data))
     arc_lookup = get_arc_lookup(data)

@@ -44,6 +44,20 @@ function _add_unit!(sys, bus, p, q_limits, base_power)
     return g
 end
 
+"""One bus holding `units`, each `(P, Q limits)` on a 100 MVA base, for calling the
+redistribution directly with a bus Q of the test's choosing."""
+function _units_at_bus(units)
+    sys = System(100.0)
+    bus = _add_simple_bus!(sys, 1, ACBusTypes.PV, 230, 1.0, 0.0)
+    gens = map(units) do (p, q_limits)
+        g = _add_simple_thermal_standard!(sys, bus, p, 0.0)
+        set_reactive_power_limits!(g, q_limits)
+        return g
+    end
+    set_units_base_system!(sys, "SYSTEM_BASE")
+    return sys, bus, gens
+end
+
 """The solved generation at `bus_number`, in system per unit, from a solve that writes
 nothing back."""
 function _solved_generation(sys, bus_number)
@@ -133,5 +147,54 @@ end
         )
         @test get_active_power(narrow) ≈ 0.2 atol = 1e-6
         @test get_active_power(wide) ≈ p_bus - 0.2 atol = 1e-6
+    end
+
+    @testset "PV bus, units online at 0 MW share the residual by their Q headroom" begin
+        # `a` makes all the P and ends at its Qmax; `b` and `c` make none. Each of them used
+        # to take the whole residual (`fraction = 1`): it swung between them until the
+        # iterations ran out, and the assertion failed with both left.
+        sys, bus, (a, b, c) = _units_at_bus([
+            (0.5, (min = -0.1, max = 0.1)),
+            (0.0, (min = -0.5, max = 0.5)),
+            (0.0, (min = -0.25, max = 0.25)),
+        ])
+        PF._reactive_power_redistribution_pv(sys, 0.3, bus, 10)
+        @test get_reactive_power(a) ≈ 0.1 atol = 1e-9
+        @test get_reactive_power(b) ≈ 0.2 * 0.5 / 0.75 atol = 1e-9
+        @test get_reactive_power(c) ≈ 0.2 * 0.25 / 0.75 atol = 1e-9
+    end
+
+    @testset "opposite sign: the unit with headroom in the residual's direction" begin
+        # Both units end at a limit, `x` at its Qmin (it must make at least 0.3) and `y` at
+        # its Qmax, which leaves a negative residual. `x` has the wider range, but only `y`
+        # can move down.
+        sys, bus, (x, y) = _units_at_bus([
+            (0.5, (min = 0.3, max = 1.0)),
+            (0.5, (min = -0.1, max = 0.1)),
+        ])
+        @test_logs (:warn, r"which keeps it within its limits") match_mode = :any begin
+            PF._reactive_power_redistribution_pv(sys, 0.3, bus, 10)
+        end
+        @test get_reactive_power(x) ≈ 0.3 atol = 1e-9
+        @test get_reactive_power(y) ≈ 0.0 atol = 1e-9
+    end
+
+    @testset "_unit_for_residual: a tie goes to the first in order" begin
+        sys, _, (u, v) = _units_at_bus([
+            (0.5, (min = -0.2, max = 0.2)),
+            (0.5, (min = -0.2, max = 0.2)),
+        ])
+        limits = PF.get_reactive_power_limits_for_power_flow
+        # The same headroom, in either direction.
+        @test PF._unit_for_residual([u, v], limits, get_reactive_power, 0.1) === u
+        @test PF._unit_for_residual([v, u], limits, get_reactive_power, -0.1) === v
+        # No headroom in the residual's direction: the widest range, tied too.
+        set_reactive_power!(u, 0.2)
+        set_reactive_power!(v, 0.2)
+        @test PF._unit_for_residual([u, v], limits, get_reactive_power, 0.1) === u
+        @test PF._unit_for_residual([v, u], limits, get_reactive_power, 0.1) === v
+        # Headroom wins over range: `v` can move up, `u` cannot.
+        set_reactive_power!(v, 0.0)
+        @test PF._unit_for_residual([u, v], limits, get_reactive_power, 0.1) === v
     end
 end
